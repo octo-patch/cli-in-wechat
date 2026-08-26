@@ -109,36 +109,40 @@ function extractResultFromParts(parts: Part[]): { text: string; thinking: string
 }
 
 /** Shared SDK client — lazily started, reused across calls */
-let sharedClient: import('@opencode-ai/sdk').OpencodeClient | null = null;
+type OpencodeSdkClient = import('@opencode-ai/sdk').OpencodeClient;
+let sharedClient: OpencodeSdkClient | null = null;
 let sharedServerClose: (() => void) | null = null;
+// Concurrent cold starts must share one connect/spawn attempt. The bridge runs
+// tools concurrently, and two unguarded `createOpencode()` calls race for the same
+// port: one loses, and the winner's `sharedServerClose` is overwritten, orphaning a
+// server that holds :4096 — the exact failure this adapter exists to avoid.
+let clientInflight: Promise<OpencodeSdkClient> | null = null;
 
 /** Stop the opencode server this adapter spawned (no-op when connecting to an existing one). */
 export function closeOpenCodeServer(): void {
   sharedServerClose?.();
   sharedServerClose = null;
   sharedClient = null;
+  clientInflight = null;
 }
 
-async function getOrCreateClient(): Promise<import('@opencode-ai/sdk').OpencodeClient> {
-  if (sharedClient) return sharedClient;
-
+async function connectOrStartClient(): Promise<OpencodeSdkClient> {
   // Prefer connecting to an existing opencode server (e.g. `opencode serve` or a TUI
   // instance). Spawning our own server on a fixed port is fragile across restarts:
   // orphaned `opencode serve` processes hold the port and force `createOpencode()` to
   // fail, then leave the client in a broken state. A standalone server is also what the
   // real deployment looks like — one headless server, many bridge instances.
   try {
-    sharedClient = createOpencodeClient({ baseUrl: 'http://127.0.0.1:4096' });
-    await sharedClient.session.list();
+    const existing = createOpencodeClient({ baseUrl: 'http://127.0.0.1:4096' });
+    await existing.session.list();
     log.info('[opencode/sdk] connected to existing server on :4096');
-    return sharedClient;
+    return existing;
   } catch (err) {
     log.warn(`[opencode/sdk] no server on :4096 (${(err as Error).message}), starting own server`);
   }
 
   try {
     const { client, server } = await createOpencode();
-    sharedClient = client;
     sharedServerClose = () => server.close();
     log.info('[opencode/sdk] server started');
     return client;
@@ -146,6 +150,32 @@ async function getOrCreateClient(): Promise<import('@opencode-ai/sdk').OpencodeC
     throw new Error(`无法启动 OpenCode SDK: ${(err as Error).message}`);
   }
 }
+
+async function getOrCreateClient(): Promise<OpencodeSdkClient> {
+  if (sharedClient) return sharedClient;
+  // Only a successful probe is cached. Assigning the probe client up front left a dead
+  // client behind whenever the :4096 probe failed and `createOpencode()` then threw:
+  // every later call took the `if (sharedClient)` fast path and returned it verbatim.
+  if (!clientInflight) {
+    clientInflight = connectOrStartClient()
+      .then((client) => { sharedClient = client; return client; })
+      .finally(() => { clientInflight = null; });
+  }
+  return clientInflight;
+}
+
+/**
+ * Every session-scoped endpoint takes the working directory as a `directory` query
+ * param. Without it the session runs in the server's own cwd, so `/cd` is ignored and
+ * the media files copied into workDir are unreachable by the relative paths we hand
+ * the model in the prompt.
+ */
+function dirQuery(workDir?: string): { directory: string } | undefined {
+  return workDir ? { directory: workDir } : undefined;
+}
+
+/** Resolves the SDK client. Injectable so the adapter can be driven by a fake in tests. */
+export type OpenCodeClientFactory = () => Promise<OpencodeSdkClient>;
 
 export class OpenCodeAdapter implements CLIAdapter {
   readonly name = 'opencode';
@@ -156,10 +186,40 @@ export class OpenCodeAdapter implements CLIAdapter {
     modes: ['auto', 'safe', 'plan'], hasEffort: false, hasModel: true, hasSearch: false, hasBudget: false,
   };
 
+  // '' means "asked this server, it has no plan agent"; undefined means "not asked yet".
+  private planAgent: string | undefined;
+
+  constructor(private readonly clientFactory: OpenCodeClientFactory = getOrCreateClient) {}
+
   async isAvailable(): Promise<boolean> { return commandExists(this.command); }
 
   close(): void {
     closeOpenCodeServer();
+  }
+
+  /**
+   * Plan mode maps onto opencode's own `plan` agent. Agents are server/config defined,
+   * so the name is only sent when this server actually publishes it — an unknown agent
+   * is a 400 that would fail the whole turn.
+   */
+  private async resolvePlanAgent(
+    client: OpencodeSdkClient,
+    directory?: { directory: string },
+  ): Promise<string | undefined> {
+    if (this.planAgent !== undefined) return this.planAgent || undefined;
+    try {
+      const result = await client.app.agents(directory ? { query: directory } : {});
+      // @ts-ignore
+      const agents = (result?.data || result) as Array<{ name?: string; mode?: string }>;
+      const found = Array.isArray(agents)
+        && agents.some((agent) => agent?.name === 'plan' && agent.mode !== 'subagent');
+      this.planAgent = found ? 'plan' : '';
+    } catch (err) {
+      log.debug(`[opencode/sdk] agent list unavailable: ${(err as Error).message}`);
+      this.planAgent = '';
+    }
+    if (!this.planAgent) log.warn('[opencode] 该 opencode server 未提供 plan agent，/mode plan 不生效');
+    return this.planAgent || undefined;
   }
 
 private resolveModelArg(model: string, workDir?: string): string {
@@ -212,25 +272,37 @@ private resolveModelArg(model: string, workDir?: string): string {
       }
     }
 
-    const client = await getOrCreateClient();
+    const client = await this.clientFactory();
+    const directory = dirQuery(workDir);
+    const dirOpt = directory ? { query: directory } : {};
 
-    // Create session
-    const session = await client.session.create({
-      body: workDir ? { title: 'cli-in-wechat' } : undefined,
-    });
-    // @ts-ignore
-    const sessionId = session.data?.id || session.id;
-    if (!sessionId) {
-      throw new Error('Failed to create OpenCode session');
+    // Reuse the session this user was already talking to. `capabilities.sessionResume`
+    // is advertised to the Router, which persists the returned id and tells the user the
+    // conversation is continuing — creating a fresh session per message (and deleting it
+    // on the way out) made every WeChat turn context-free while still claiming otherwise.
+    let sessionId = '';
+    const prevSid = settings.sessionIds[this.name];
+    if (prevSid) {
+      try {
+        await client.session.get({ path: { id: prevSid }, ...dirOpt });
+        sessionId = prevSid;
+        log.debug(`[opencode/sdk] resumed session: ${sessionId}`);
+      } catch {
+        log.debug(`[opencode/sdk] stored session ${prevSid} is gone, starting a new one`);
+      }
     }
 
-    log.debug(`[opencode/sdk] session created: ${sessionId}`);
-
-    // Restore previous session if resume is enabled
-    const prevSid = settings.sessionIds[this.name];
-    if (prevSid && prevSid !== sessionId) {
-      // OpenCode SDK doesn't have a direct "resume" API like CLI --resume flag.
-      // We just use the newly created session.
+    if (!sessionId) {
+      const session = await client.session.create({
+        body: { title: 'cli-in-wechat' },
+        ...dirOpt,
+      });
+      // @ts-ignore
+      sessionId = session.data?.id || session.id || '';
+      if (!sessionId) {
+        throw new Error('Failed to create OpenCode session');
+      }
+      log.debug(`[opencode/sdk] session created: ${sessionId}`);
     }
 
     // Subscribe to SSE events
@@ -247,8 +319,12 @@ private resolveModelArg(model: string, workDir?: string): string {
     const msgMode = settings.msgMode || 'normal';
     const streamIntermediate = msgMode !== 'compact' && onIntermediate;
 
-    const sseResult = await client.event.subscribe();
-    void (async () => {
+    // Every execute() opened a fresh SSE subscription and never closed it: the loop only
+    // returns when a *later* event arrives after `finished`, so a quiet stream stayed open
+    // for the life of the process, one leaked subscription per WeChat message.
+    const sseAbort = new AbortController();
+    const sseResult = await client.event.subscribe({ signal: sseAbort.signal });
+    const sseDone = (async () => {
       try {
         for await (const ev of sseResult.stream) {
           if (finished) return;
@@ -294,13 +370,19 @@ private resolveModelArg(model: string, workDir?: string): string {
                 const text = textPart.text || '';
                 // Full snapshot replaces this part's text (keyed by part id) so a
                 // multi-part turn keeps every segment without duplication.
+                // `updated` carries the whole part every time, so a part that grows over
+                // several snapshots would be pushed to WeChat once per snapshot, each copy
+                // longer than the last. Emit only the suffix that is actually new; the
+                // stored snapshot still replaces wholesale for the final assembly.
+                const previous = partId ? (textParts.get(partId) || '') : '';
                 if (partId) {
                   if (text) textParts.set(partId, text);
                 } else {
                   resultText = text;
                 }
-                if (streamIntermediate && text.trim()) {
-                  onIntermediate!({ type: 'text', content: text });
+                const fresh = text.startsWith(previous) ? text.slice(previous.length) : text;
+                if (streamIntermediate && fresh.trim()) {
+                  onIntermediate!({ type: 'text', content: fresh });
                 }
               } else if (part.type === 'reasoning') {
                 const reasoningPart = part as any;
@@ -328,6 +410,30 @@ private resolveModelArg(model: string, workDir?: string): string {
             // above. Reasoning deltas are only kept if thinking is enabled (updated already
             // carries the full reasoning snapshot, so these are redundant too).
             case 'message.part.delta': {
+              break;
+            }
+
+            // A headless bridge has nobody to answer a permission prompt. Left unanswered
+            // the session simply stops until the (now one hour) timeout fires, so every
+            // request is resolved here: approved under /mode auto, refused otherwise so
+            // the model gets a real denial and can carry on.
+            case 'permission.updated': {
+              const permission = properties as unknown as { id?: string; sessionID?: string; title?: string };
+              if (!permission.id) break;
+              const response = settings.mode === 'auto' ? 'always' : 'reject';
+              void client.postSessionIdPermissionsPermissionId({
+                path: { id: sessionId, permissionID: permission.id },
+                body: { response },
+                ...dirOpt,
+              }).catch((err: unknown) => {
+                log.warn(`[opencode/sdk] permission reply failed: ${(err as Error).message}`);
+              });
+              if (response === 'reject' && streamIntermediate) {
+                onIntermediate!({
+                  type: 'tool_result',
+                  content: `  ↳ 已拒绝权限请求（${permission.title || '未知操作'}）：非 auto 模式`,
+                });
+              }
               break;
             }
 
@@ -370,13 +476,14 @@ private resolveModelArg(model: string, workDir?: string): string {
       modelConfig.model = { providerID, modelID };
     }
 
-    // Build permission mode
-    let permissionMode = 'default';
-    if (settings.mode === 'auto') {
-      permissionMode = 'bypassPermissions';
-    } else if (settings.mode === 'plan') {
-      permissionMode = 'plan';
-    }
+    // `permissionMode` was invented: no such field exists on the prompt body anywhere in
+    // @opencode-ai/sdk, and the `as any` cast hid that from tsc, so /mode auto and /mode
+    // plan were silently dropped. Permissions are answered through `permission.updated`
+    // in the SSE loop above; plan mode is the server's own `plan` agent, used only when
+    // this server actually publishes one.
+    const agentName = settings.mode === 'plan'
+      ? await this.resolvePlanAgent(client, directory)
+      : undefined;
 
     // Send prompt async (non-blocking)
     try {
@@ -385,10 +492,11 @@ private resolveModelArg(model: string, workDir?: string): string {
         body: {
           parts: [{ type: 'text', text: fullPrompt }],
           ...modelConfig,
-          ...(permissionMode !== 'default' ? { permissionMode } : {}),
+          ...(agentName ? { agent: agentName } : {}),
         } as any,
+        ...dirOpt,
       });
-      log.debug(`[opencode/sdk] prompt sent async`);
+      log.debug(`[opencode/sdk] prompt sent async${agentName ? ` (agent=${agentName})` : ''}`);
     } catch (err) {
       log.error(`[opencode/sdk] promptAsync failed: ${(err as Error).message}`);
       resultError = true;
@@ -403,16 +511,17 @@ private resolveModelArg(model: string, workDir?: string): string {
     while (!finished && (Date.now() - start) < timeout) {
       if (signal?.aborted) {
         try {
-          await client.session.abort({ path: { id: sessionId } });
+          await client.session.abort({ path: { id: sessionId }, ...dirOpt });
         } catch { /* ignore */ }
-        return { text: '已取消', error: true };
+        sseAbort.abort();
+        return { text: '已取消', sessionId, error: true };
       }
 
       await new Promise((resolve) => setTimeout(resolve, 500));
 
       // Check session status
       try {
-        const statusResult = await client.session.status();
+        const statusResult = await client.session.status({ ...dirOpt });
         // @ts-ignore
         const statuses = statusResult.data || statusResult;
         const sessionStatus = (statuses as any)?.[sessionId];
@@ -426,7 +535,7 @@ private resolveModelArg(model: string, workDir?: string): string {
 
     if (Date.now() - start >= timeout && !finished) {
       try {
-        await client.session.abort({ path: { id: sessionId } });
+        await client.session.abort({ path: { id: sessionId }, ...dirOpt });
       } catch { /* ignore */ }
       resultText += '\n[超时]';
       resultError = true;
@@ -440,7 +549,7 @@ private resolveModelArg(model: string, workDir?: string): string {
     try {
       const messagesResult = await client.session.messages({
         path: { id: sessionId },
-        query: { limit: 1 },
+        query: { ...(directory || {}), limit: 1 },
       });
       // @ts-ignore
       const messages = messagesResult.data || messagesResult;
@@ -455,12 +564,10 @@ private resolveModelArg(model: string, workDir?: string): string {
       log.debug(`[opencode/sdk] failed to fetch messages: ${(err as Error).message}`);
     }
 
-    // Clean up session
-    try {
-      await client.session.delete({ path: { id: sessionId } });
-    } catch {
-      // ignore cleanup errors
-    }
+    // The session is deliberately kept: it is this user's conversation, and the Router
+    // persists the id for the next turn. Only the SSE subscription is released here.
+    sseAbort.abort();
+    await sseDone.catch(() => { /* the abort itself surfaces here */ });
 
     return {
       text: resultText || '(无输出)',
