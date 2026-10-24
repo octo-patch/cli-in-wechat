@@ -4,6 +4,10 @@ import assert from 'node:assert/strict';
 import { Router, createSendFileMarkerStripper } from '../src/bridge/router.js';
 import { DeliveryFinalizationError } from '../src/ilink/client.js';
 import { DEFAULT_SETTINGS } from '../src/adapters/base.js';
+import { CodexAdapter, type CodexSpawn } from '../src/adapters/codex.js';
+import { EventEmitter } from 'node:events';
+import { PassThrough } from 'node:stream';
+import type { ChildProcess } from 'node:child_process';
 import type { BridgeConfig } from '../src/config.js';
 import type { WeixinMessage } from '../src/ilink/types.js';
 
@@ -373,6 +377,55 @@ test('compact normal and verbose preserve delivery content order and priorities'
       assert.equal(messages[1].options?.priority, 'activity');
       assert.equal(messages[2].options?.priority, 'final');
       assert.doesNotMatch(messages[2].text, /streamed answer|Activity|后续内容已排队/);
+    });
+  }
+});
+
+function codexJsonlSpawn(stdoutText: string): CodexSpawn {
+  return () => {
+    const child = new EventEmitter() as unknown as ChildProcess;
+    const stdin = new PassThrough();
+    const stdout = new PassThrough();
+    const stderr = new PassThrough();
+    stdin.resume();
+    Object.assign(child, { stdin, stdout, stderr, killed: false, exitCode: null, pid: 4244, kill: () => true });
+    queueMicrotask(() => {
+      stdout.end(stdoutText);
+      stderr.end();
+      setImmediate(() => { Object.assign(child, { exitCode: 0 }); child.emit('close', 0, null); });
+    });
+    return child;
+  };
+}
+
+test('codex final answer is delivered exactly once after earlier text was streamed', async (t) => {
+  const stdoutText = [
+    { type: 'thread.started', thread_id: 'thr_router' },
+    { type: 'turn.started' },
+    { type: 'item.completed', item: { id: 'm1', type: 'agent_message', text: 'Let me look first.' } },
+    { type: 'item.started', item: { id: 'c1', type: 'command_execution', command: 'ls', status: 'in_progress' } },
+    { type: 'item.completed', item: { id: 'c1', type: 'command_execution', command: 'ls', exit_code: 0, status: 'completed' } },
+    { type: 'item.completed', item: { id: 'm2', type: 'agent_message', text: 'FINAL-ANSWER-42' } },
+    { type: 'turn.completed', usage: { input_tokens: 1, output_tokens: 1 } },
+  ].map((e) => JSON.stringify(e)).join('\n') + '\n';
+
+  for (const mode of ['compact', 'normal', 'verbose'] as const) {
+    await t.test(mode, async () => {
+      const { router, sessions, messages } = createRouter();
+      sessions.update('u1', { msgMode: mode } as any);
+      const adapter = new CodexAdapter(codexJsonlSpawn(stdoutText));
+      (router as any).registry.get = () => adapter;
+
+      await router.exec('u1', 'codex', 'hello');
+
+      const all = messages.map((m) => m.text).join('\n---\n');
+      assert.equal(all.split('FINAL-ANSWER-42').length - 1, 1, `final answer must appear exactly once:\n${all}`);
+      if (mode === 'compact') {
+        assert.equal(messages.length, 1);
+        assert.doesNotMatch(all, /Let me look first/);
+      } else {
+        assert.equal(all.split('Let me look first.').length - 1, 1);
+      }
     });
   }
 });
