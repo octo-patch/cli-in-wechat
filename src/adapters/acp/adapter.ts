@@ -45,6 +45,10 @@ const REPLAY_IDLE_MS = 100;
 const REPLAY_DRAIN_MAX_MS = 5_000;
 /** After session/cancel, give the agent this long to finish the turn before killing it. */
 const CANCEL_GRACE_MS = 2_000;
+/** On finish: let the agent exit on stdin EOF for this long, then kill it and wait (bounded)
+ *  so no agent outlives the run (Windows also keeps its cwd locked until it exits). */
+const EXIT_AFTER_EOF_MS = 250;
+const EXIT_AFTER_KILL_MS = 2_000;
 const MAX_INLINE_IMAGE_BYTES = 10 * 1024 * 1024;
 const STDERR_TAIL_CHARS = 2_000;
 
@@ -113,9 +117,10 @@ export class AcpAdapter implements CLIAdapter {
     proc.stderr?.on('data', (c: string) => { stderrTail = (stderrTail + c).slice(-STDERR_TAIL_CHARS); });
     proc.stdin?.on('error', (e) => log.debug(`[${this.name}] stdin error (ignored):`, e.message));
     let spawnError: Error | null = null;
+    let hasExited = false;
     const exited = new Promise<void>((done) => {
-      proc.once('close', () => done());
-      proc.once('error', (e) => { spawnError = e; done(); });
+      proc.once('close', () => { hasExited = true; done(); });
+      proc.once('error', (e) => { spawnError = e; hasExited = true; done(); });
     });
 
     // ── Per-run state ──
@@ -364,7 +369,7 @@ export class AcpAdapter implements CLIAdapter {
         return await fail(`${this.displayName} 启动超时（${e.method} ${Math.round(e.timeoutMs / 1000)}s 无响应），可能需要先在终端登录`);
       }
       // Process died mid-run: wait briefly for exit so stderr is complete.
-      await Promise.race([exited, sleep(1_000)]);
+      await within(exited, 1_000);
       if (spawnError) return await fail(`无法启动 ${this.displayName}: ${(spawnError as Error).message}`);
       const tail = stderrTail.trim();
       const code = proc.exitCode;
@@ -375,7 +380,11 @@ export class AcpAdapter implements CLIAdapter {
       signal?.removeEventListener('abort', onAbort);
       client.close(new Error('ACP run finished'));
       try { proc.stdin?.end(); } catch { /* ignore */ }
-      killProc(proc);
+      if (!hasExited) await within(exited, EXIT_AFTER_EOF_MS);
+      if (!hasExited) {
+        killProc(proc);
+        await within(exited, EXIT_AFTER_KILL_MS);
+      }
     }
   }
 
@@ -396,6 +405,13 @@ function oneLine(s: string): string {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((done) => setTimeout(done, ms));
+}
+
+/** Wait for `p`, but never longer than `ms` (the timer is cleared either way). */
+async function within(p: Promise<void>, ms: number): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  await Promise.race([p, new Promise<void>((done) => { timer = setTimeout(done, ms); })]);
+  clearTimeout(timer);
 }
 
 async function drainReplay(lastUpdateAt: () => number, stopped: () => boolean): Promise<void> {

@@ -18,6 +18,7 @@
 //       {raw: "line"}         write a raw stdout line (e.g. non-JSON noise)
 //       {exit: code}          exit the process immediately
 //   stopReason                → final stopReason (default end_turn)
+//   ignoreEof                 → do not exit when stdin closes
 import { appendFileSync } from 'node:fs';
 
 const scenario = JSON.parse(process.env.FAKE_ACP_SCENARIO || '{}');
@@ -110,4 +111,6 @@ process.stdin.on('data', (chunk) => {
     if (line) void handle(JSON.parse(line));
   }
 });
-process.stdin.on('end', () => process.exit(0));
+// ignoreEof: keep running after stdin closes, so the client has to kill us.
+if (scenario.ignoreEof) setInterval(() => {}, 1_000);
+process.stdin.on('end', () => { if (!scenario.ignoreEof) process.exit(0); });

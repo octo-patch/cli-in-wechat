@@ -4,8 +4,9 @@ import { mkdtempSync, readFileSync, writeFileSync, existsSync, rmSync } from 'no
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { spawn, type ChildProcess } from 'node:child_process';
 
-import { DEFAULT_SETTINGS, spawnCli, type IntermediateMessage, type ToolMode, type PermissionRequest } from '../src/adapters/base.js';
+import { DEFAULT_SETTINGS, type IntermediateMessage, type ToolMode, type PermissionRequest } from '../src/adapters/base.js';
 import { AcpAdapter, type AcpPreset } from '../src/adapters/acp/adapter.js';
 import { ACP_PRESETS } from '../src/adapters/acp/presets.js';
 import { AdapterRegistry } from '../src/adapters/registry.js';
@@ -16,7 +17,7 @@ interface Run {
   adapter: AcpAdapter;
   workDir: string;
   log: () => any[];
-  spawned: { command?: string; args?: string[]; cwd?: string; env?: NodeJS.ProcessEnv };
+  spawned: { command?: string; args?: string[]; cwd?: string; env?: NodeJS.ProcessEnv; child?: ChildProcess };
 }
 
 function setup(scenario: Record<string, unknown>, preset: Partial<AcpPreset> = {}): Run {
@@ -29,18 +30,23 @@ function setup(scenario: Record<string, unknown>, preset: Partial<AcpPreset> = {
     ...preset,
   }, (command, args, options) => {
     Object.assign(spawned, { command, args: [...args], cwd: options.cwd, env: options.env });
-    return spawnCli(command, args, options);
+    // Plain spawn (no Windows cmd.exe fallback layer) keeps process lifetime deterministic.
+    spawned.child = spawn(command, args, options);
+    return spawned.child;
   });
   const log = () => existsSync(logPath)
     ? readFileSync(logPath, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l))
     : [];
-  test.after(() => rmSync(workDir, { recursive: true, force: true }));
+  // Windows may hold the dir briefly after the agent (whose cwd it was) exits.
+  test.after(() => rmSync(workDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }));
   return { adapter, workDir, log, spawned };
 }
 
 function settings(workDir: string, extra: { mode?: ToolMode; sessionIds?: Record<string, string> } = {}) {
   return { ...DEFAULT_SETTINGS, workDir, mode: extra.mode ?? 'auto', sessionIds: extra.sessionIds ?? {} };
 }
+
+const isGone = (child?: ChildProcess) => !!child && (child.exitCode !== null || child.signalCode !== null);
 
 const msg = (text: string, messageId?: string) => ({ update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text }, ...(messageId ? { messageId } : {}) } });
 const thought = (text: string) => ({ update: { sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text } } });
@@ -88,6 +94,7 @@ test('new session: handshake params, aggregated text/thinking, tool events, set_
   assert.equal(result.thinking, 'Let me look.');
   assert.equal(result.sessionId, 'sess-new-1');
   assert.equal(result.error, undefined);
+  assert.ok(isGone(run.spawned.child), 'agent process has exited before execute resolves');
 
   const sent = run.log();
   const init = sent.find((m) => m.method === 'initialize');
@@ -231,6 +238,16 @@ test('cancel: an agent that ignores session/cancel is killed after the grace per
   const result = await pending;
   assert.equal(result.text, '已取消');
   assert.ok(Date.now() - started < 10_000);
+  assert.ok(isGone(run.spawned.child));
+});
+
+test('finish: an agent that ignores stdin EOF is killed, and execute still returns promptly', async () => {
+  const run = setup({ ignoreEof: true, prompt: [msg('bye')] });
+  const started = Date.now();
+  const result = await run.adapter.execute('q', { settings: settings(run.workDir) });
+  assert.equal(result.text, 'bye');
+  assert.ok(isGone(run.spawned.child), 'killed after the EOF grace period');
+  assert.ok(Date.now() - started < 5_000);
 });
 
 test('cancel: already-aborted signal never spawns', async () => {
