@@ -244,6 +244,112 @@ test('can_use_tool: safe/plan deny with a reason, auto allows, AskUserQuestion r
   }
 });
 
+test('safe mode asks requestPermission: allow once, always allow (suggestions), reject, throw, timeout', async () => {
+  const suggestion = { type: 'addRules', rules: [{ toolName: 'Bash', ruleContent: 'npm test:*' }], behavior: 'allow', destination: 'localSettings' };
+  const asks: any[] = [];
+  const signals: Array<AbortSignal | undefined> = [];
+  const answers: Array<() => Promise<string | null>> = [
+    async () => 'allow_once',
+    async () => 'allow_always',
+    async () => 'reject_once',
+    async () => null,
+    async () => { throw new Error('boom'); },
+    () => new Promise((_, reject) => setTimeout(() => reject(new Error('approval timed out')), 5)),
+    async () => 'something_else',
+  ];
+  const ids = answers.map((_, i) => `p${i}`);
+  const responses: any[] = [];
+  const fake = fakeSpawn(async (p) => {
+    await p.userMessage();
+    p.emit(init);
+    for (const id of ids) {
+      const req = canUseTool(id, 'Bash', { command: 'npm test' });
+      (req.request as any).permission_suggestions = [suggestion];
+      p.emit(req);
+      responses.push((await p.next(responseTo(id))).response.response);
+    }
+    p.emit(success('ok'));
+  });
+  let n = 0;
+  const result = await new ClaudeAdapter(fake.spawn).execute('hi', {
+    settings: settings({ mode: 'safe' }),
+    requestPermission: (req, signal) => { asks.push(req); signals.push(signal); return answers[n++](); },
+  });
+  assert.equal(result.text, 'ok');
+  assert.equal(asks.length, answers.length);
+  assert.deepEqual(asks[0], {
+    title: 'Shell Command: `npm test`',
+    kind: 'execute',
+    options: [
+      { id: 'allow_once', name: '允许一次', kind: 'allow_once' },
+      { id: 'allow_always', name: '总是允许', kind: 'allow_always' },
+      { id: 'reject_once', name: '拒绝', kind: 'reject_once' },
+    ],
+  });
+  assert.ok(signals.every((s) => s instanceof AbortSignal));
+  assert.deepEqual(responses[0], { behavior: 'allow', updatedInput: { command: 'npm test' }, toolUseID: 'tu_p0' });
+  assert.deepEqual(responses[1], {
+    behavior: 'allow', updatedInput: { command: 'npm test' }, updatedPermissions: [suggestion], toolUseID: 'tu_p1',
+  });
+  for (const r of responses.slice(2)) {
+    assert.deepEqual(r, { behavior: 'deny', message: '用户拒绝了 Bash', toolUseID: r.toolUseID });
+  }
+});
+
+test('requestPermission: no "always" without suggestions, plan never asks, cancelled ask aborts its signal', async () => {
+  // No permission_suggestions (or suppress_always_allow_rule) -> only allow once / reject.
+  for (const extra of [{ permission_suggestions: [] }, { permission_suggestions: [{ type: 'addRules' }], suppress_always_allow_rule: true }]) {
+    let asked: any;
+    const fake = fakeSpawn(async (p) => {
+      await p.userMessage();
+      const req = canUseTool('r1', 'Write', { file_path: '/a/b.txt', content: 'x' });
+      Object.assign(req.request, extra);
+      p.emit(init, req);
+      await p.next(responseTo('r1'));
+      p.emit(success('ok'));
+    });
+    await new ClaudeAdapter(fake.spawn).execute('hi', {
+      settings: settings({ mode: 'safe' }),
+      requestPermission: async (req) => { asked = req; return 'allow_always'; },
+    });
+    assert.deepEqual(asked.options.map((o: any) => o.id), ['allow_once', 'reject_once']);
+    assert.equal(asked.kind, 'edit');
+    // "always" was not offered, so choosing it anyway is a rejection.
+    assert.equal(fake.calls[0].proc.written.find(responseTo('r1')).response.response.behavior, 'deny');
+  }
+
+  // Plan mode keeps denying without asking.
+  let planAsked = false;
+  const plan = fakeSpawn(async (p) => {
+    await p.userMessage();
+    p.emit(init, canUseTool('r1', 'Write', { file_path: '/a.txt' }));
+    await p.next(responseTo('r1'));
+    p.emit(success('ok'));
+  });
+  await new ClaudeAdapter(plan.spawn).execute('hi', {
+    settings: settings({ mode: 'plan' }),
+    requestPermission: async () => { planAsked = true; return 'allow_once'; },
+  });
+  assert.equal(planAsked, false);
+  assert.equal(plan.calls[0].proc.written.find(responseTo('r1')).response.response.behavior, 'deny');
+
+  // The CLI cancelling the ask aborts the hook's signal and the late answer is dropped.
+  let aborted = false;
+  const cancel = fakeSpawn(async (p) => {
+    await p.userMessage();
+    p.emit(init, canUseTool('c1', 'Bash', { command: 'ls' }));
+    setTimeout(() => { p.emit({ type: 'control_cancel_request', request_id: 'c1' }); setTimeout(() => p.emit(success('ok')), 10); }, 5);
+  });
+  await new ClaudeAdapter(cancel.spawn).execute('hi', {
+    settings: settings({ mode: 'safe' }),
+    requestPermission: (_req, signal) => new Promise((resolve) => {
+      signal?.addEventListener('abort', () => { aborted = true; resolve('allow_once'); });
+    }),
+  });
+  assert.equal(aborted, true);
+  assert.equal(cancel.calls[0].proc.written.find(responseTo('c1')), undefined);
+});
+
 test('unsupported control requests get an error response; cancelled permission asks are not answered', async () => {
   let resolveAsk!: (v: Record<string, string>) => void;
   const fake = fakeSpawn(async (p) => {

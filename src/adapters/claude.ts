@@ -1,7 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { log } from '../utils/logger.js';
 import type { DownloadedMedia } from '../utils/media.js';
-import type { CLIAdapter, ExecOptions, ExecResult, AdapterCapabilities, ToolMode, UserSettings } from './base.js';
+import type { CLIAdapter, ExecOptions, ExecResult, AdapterCapabilities, PermissionRequest, ToolMode, UserSettings } from './base.js';
 import {
   commandExists,
   spawnCli,
@@ -47,6 +47,8 @@ export interface CanUseToolRequest {
   tool_use_id?: string;
   /** Rules that would stop the CLI asking again this session ("always allow"). */
   permission_suggestions?: unknown[];
+  /** Set when an "always allow" rule would grant more than this ask: offer no persistent option. */
+  suppress_always_allow_rule?: boolean;
   title?: string;
   description?: string;
   decision_reason?: string;
@@ -62,18 +64,24 @@ export type PermissionDecision =
  * the permission mode did not settle itself. AskUserQuestion is answered through WeChat (the
  * CLI routes it here in every mode, bypass included, because the tool requires user
  * interaction). In auto (bypass) anything else that still asks is allowed, matching bypass.
- * In safe/plan, in-WeChat approval (allow once / always allow this session via
- * `permission_suggestions` → `updatedPermissions` / deny) plugs in here in a later PR; until
- * then those asks are denied with a readable reason, never silently allowed. Plan mode stays
- * read-only either way: the CLI enforces it and every write that asks is denied here.
+ * In safe, the ask goes to the user through `requestPermission` (allow once / always allow
+ * via `permission_suggestions` → `updatedPermissions` / reject); without that hook it is denied
+ * with a readable reason, never silently allowed. Plan mode stays read-only: the CLI enforces
+ * it and every write that asks is denied here, without asking anyone.
  */
 export async function decidePermission(
   req: CanUseToolRequest,
-  ctx: { mode: ToolMode; askUser?: ExecOptions['askUser'] },
+  ctx: {
+    mode: ToolMode;
+    askUser?: ExecOptions['askUser'];
+    requestPermission?: ExecOptions['requestPermission'];
+    signal?: AbortSignal;
+  },
 ): Promise<PermissionDecision> {
   const input = req.input ?? {};
   if (req.tool_name !== 'AskUserQuestion') {
     if (ctx.mode === 'auto') return { behavior: 'allow', updatedInput: input };
+    if (ctx.mode === 'safe' && ctx.requestPermission) return askApproval(req, input, ctx.requestPermission, ctx.signal);
     return { behavior: 'deny', message: denyMessage(ctx.mode, req.tool_name) };
   }
   if (!ctx.askUser) return { behavior: 'deny', message: '当前无法向用户提问，请自行判断后继续' };
@@ -92,6 +100,44 @@ export async function decidePermission(
     log.error('[claude] AskUserQuestion failed:', err);
     return { behavior: 'deny', message: '用户未回复' };
   }
+}
+
+/** Safe-mode approval through the bridge. A throw, a timeout on the bridge side (null) or an
+ *  unknown option id all count as a rejection. */
+async function askApproval(
+  req: CanUseToolRequest,
+  input: Record<string, unknown>,
+  requestPermission: NonNullable<ExecOptions['requestPermission']>,
+  signal?: AbortSignal,
+): Promise<PermissionDecision> {
+  const suggestions = !req.suppress_always_allow_rule && Array.isArray(req.permission_suggestions)
+    ? req.permission_suggestions : [];
+  const options: PermissionRequest['options'] = [{ id: 'allow_once', name: '允许一次', kind: 'allow_once' }];
+  if (suggestions.length) options.push({ id: 'allow_always', name: '总是允许', kind: 'allow_always' });
+  options.push({ id: 'reject_once', name: '拒绝', kind: 'reject_once' });
+  const summary = summarizeToolUse(req.tool_name, input).replace(/^- /, '');
+  const title = req.description ? `${summary} — ${req.description.slice(0, 200)}` : summary;
+
+  let choice: string | null = null;
+  try {
+    choice = await requestPermission({ title, kind: toolKind(req.tool_name), options }, signal);
+  } catch (err) {
+    log.warn(`[claude] 审批 ${req.tool_name} 失败，按拒绝处理:`, (err as Error).message);
+  }
+  if (choice === 'allow_once') return { behavior: 'allow', updatedInput: input };
+  if (choice === 'allow_always' && suggestions.length) {
+    return { behavior: 'allow', updatedInput: input, updatedPermissions: suggestions };
+  }
+  return { behavior: 'deny', message: `用户拒绝了 ${req.tool_name}` };
+}
+
+/** ACP-style tool kind for the approval prompt, when the tool maps onto one. */
+function toolKind(toolName: string): string | undefined {
+  if (/^bash$/i.test(toolName)) return 'execute';
+  if (/^(edit|multiedit|write|notebookedit)$/i.test(toolName)) return 'edit';
+  if (/^(read|glob|grep|ls|notebookread)$/i.test(toolName)) return 'read';
+  if (/^(webfetch|websearch)$/i.test(toolName)) return 'fetch';
+  return undefined;
 }
 
 export class ClaudeAdapter implements CLIAdapter {
@@ -172,6 +218,9 @@ export class ClaudeAdapter implements CLIAdapter {
       const toolNames = new Map<string, string>();
       // can_use_tool requests the CLI has since cancelled: their late answers are dropped.
       const cancelledRequests = new Set<string>();
+      // Pending approvals, aborted when the CLI cancels the ask or the run ends/is cancelled.
+      const pendingAsks = new Map<string, AbortController>();
+      const abortAsks = (): void => { for (const c of pendingAsks.values()) c.abort(); pendingAsks.clear(); };
       let requestSeq = 0;
 
       const send = (obj: object): void => {
@@ -203,19 +252,24 @@ export class ClaudeAdapter implements CLIAdapter {
         send({ type: 'control_request', request_id: `wx_interrupt_${++requestSeq}`, request: { subtype: 'interrupt' } });
         killTimer = setTimeout(() => killProc(proc), this.interruptGraceMs);
       };
-      const onAbort = (): void => stop('cancel');
+      const onAbort = (): void => { abortAsks(); stop('cancel'); };
       opts.signal?.addEventListener('abort', onAbort, { once: true });
 
       const answerPermission = async (requestId: string, req: CanUseToolRequest): Promise<void> => {
-        const isQuestion = req.tool_name === 'AskUserQuestion';
-        if (isQuestion) pauseIdle(); // waiting on the user is not the agent going idle
+        const waitsOnUser = req.tool_name === 'AskUserQuestion' || (settings.mode === 'safe' && !!opts.requestPermission);
+        if (waitsOnUser) pauseIdle(); // waiting on the user is not the agent going idle
+        const ask = new AbortController();
+        pendingAsks.set(requestId, ask);
         let decision: PermissionDecision;
         try {
-          decision = await decidePermission(req, { mode: settings.mode, askUser: opts.askUser });
+          decision = await decidePermission(req, {
+            mode: settings.mode, askUser: opts.askUser, requestPermission: opts.requestPermission, signal: ask.signal,
+          });
         } catch (err) {
           decision = { behavior: 'deny', message: `权限处理出错：${(err as Error).message}` };
         }
-        if (isQuestion) armIdle();
+        pendingAsks.delete(requestId);
+        if (waitsOnUser) armIdle();
         if (cancelledRequests.delete(requestId)) return;
         send({
           type: 'control_response',
@@ -234,6 +288,7 @@ export class ClaudeAdapter implements CLIAdapter {
           }
           case 'control_cancel_request':
             cancelledRequests.add(msg.request_id);
+            pendingAsks.get(msg.request_id)?.abort();
             return;
           case 'system':
             // Known before any work happens, so a cancelled/timed-out run can still be resumed.
@@ -324,6 +379,7 @@ export class ClaudeAdapter implements CLIAdapter {
         if (settled) return;
         settled = true;
         pauseIdle();
+        abortAsks();
         if (killTimer) clearTimeout(killTimer);
         opts.signal?.removeEventListener('abort', onAbort);
         resolve(res);
