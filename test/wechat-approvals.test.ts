@@ -213,6 +213,13 @@ test('choosing 2 auto-approves the same program for that tool until /new or /res
   assert.deepEqual(results.slice(4), ['opt-reject', 'opt-once', 'opt-once', 'opt-once']);
 });
 
+test('/mode safe explains how to answer, with the narrowed meaning of 2', async () => {
+  const { router, messages } = createRouter({ claude: async () => ({ text: 'ok' }) });
+  await router.handleSlash('u1', '/mode safe');
+  assert.match(messages.at(-1)!.text, /^SAFE = 每次敏感操作在微信里问你\n回 1 允许一次 \/ 2 本会话自动允许同类（同一程序的命令或同类操作，提示里写明范围） \/ 3 拒绝，5 分钟无回复自动拒绝/);
+  router.stop();
+});
+
 test('the grant key narrows execute to the program and falls back to kind or tool name', async () => {
   const { router } = createRouter({ claude: async () => ({ text: 'ok' }) });
   const rule = (req: Partial<PermissionRequest>) => {
