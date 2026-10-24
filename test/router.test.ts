@@ -135,17 +135,13 @@ test('getCli fallback to refText if no @tool mention', () => {
   assert.equal(tool, 'claude');
 });
 
-test('pending question resolution follows getCli-selected tool', async () => {
+test('a waiting question takes the next reply instead of starting a new agent run', async () => {
   const { router, sessions } = createRouter();
   sessions.update('u1', { defaultTool: 'gemini' });
 
-  let resolvedAnswer = '';
-  router.pendingQuestions.set('u1:codex', {
-    resolve: (answer: string) => {
-      resolvedAnswer = answer;
-    },
-    timeout: setTimeout(() => {}, 1000),
-    toolName: 'codex',
+  // Questions are queued per user (not per tool), so the reply needs no @tool routing.
+  const answer = router.askUserViaWeChat('u1', 'codex', {
+    questions: [{ question: 'Pick', options: [{ label: 'a' }, { label: 'b' }] }],
   });
 
   let execCalled = false;
@@ -153,11 +149,11 @@ test('pending question resolution follows getCli-selected tool', async () => {
     execCalled = true;
   };
 
-  await router.handle(makeMessage('u1'), '@codex 2', 'question body\n— Claude | 等待回复');
+  await router.handle(makeMessage('u1'), '2', 'question body\n— Claude | 等待回复');
 
-  assert.equal(resolvedAnswer, '@codex 2');
+  assert.deepEqual(await answer, { Pick: 'b' });
   assert.equal(execCalled, false);
-  assert.equal(router.pendingQuestions.has('u1:codex'), false);
+  assert.equal(router.interactions.size, 0);
 });
 
 test('handle() rejects unknown @tool mention', async () => {

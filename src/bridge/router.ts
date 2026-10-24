@@ -10,7 +10,7 @@ import { SessionManager } from './session.js';
 import { formatResponse } from './formatter.js';
 import type { WeixinMessage } from '../ilink/types.js';
 import type { BridgeConfig } from '../config.js';
-import { DEFAULT_SETTINGS, type AskUserRequest, type MsgMode } from '../adapters/base.js';
+import { DEFAULT_SETTINGS, type AskUserRequest, type MsgMode, type PermissionRequest } from '../adapters/base.js';
 import type { DownloadedMedia } from '../utils/media.js';
 import type { OutboxItem } from '../ilink/outbox.js';
 import {
@@ -36,7 +36,34 @@ export interface RouterOptions {
 }
 
 type DeliveryStatusView = { quota: { generation: number }; pending: Array<Pick<OutboxItem, 'itemId'>>; failed?: Array<Pick<OutboxItem, 'itemId'>> };
-interface PendingQuestion { resolve: (answer: string) => void; timeout: ReturnType<typeof setTimeout>; toolName: string }
+
+/** Why a pending interaction ended without a usable answer. */
+type InteractionEnd = 'timeout' | 'cancelled' | 'invalid' | 'stopped' | 'unsent';
+
+/**
+ * One prompt waiting for the user's WeChat reply: an AskUser question or a tool approval.
+ * Interactions are queued per user and shown one at a time, so a bare "1" is never ambiguous.
+ * They live in memory only: the CLI process that asked dies with the bridge, so after a
+ * restart there is nobody left to deliver an answer to (see `staleAnswerHint`).
+ */
+interface PendingInteraction {
+  text: string;
+  /** Sent once after an invalid reply; absent when every reply is a valid answer. */
+  retryText?: string;
+  retried: boolean;
+  /** Try to settle with this reply; false when the reply is not a valid answer. */
+  answer: (reply: string) => boolean;
+  /** Settle without asking when the answer is already known (a session grant); true if settled. */
+  preempt: () => boolean;
+  expire: (why: InteractionEnd) => void;
+  timer?: ReturnType<typeof setTimeout>;
+}
+
+const INTERACTION_TIMEOUT_MS = 300_000;
+/** A reply that only makes sense as an answer to a numbered prompt: "2", "1,3". */
+const BARE_ANSWER = /^\d{1,2}(?:\s*[,，]\s*\d{1,2})*$/;
+/** A late bare answer within this window gets a hint instead of reaching an Agent as a prompt. */
+const STALE_ANSWER_WINDOW_MS = 30 * 60_000;
 
 /** Built fresh per call: a shared /g regex carries lastIndex state across calls. */
 const sendFileMarkerRegex = (): RegExp => /\[SEND_FILE:\s*([^\]]+)\]/g;
@@ -95,7 +122,12 @@ export class Router {
   private config: BridgeConfig;
   private active = new Map<string, ActiveTask>();
   private lastResponse = new Map<string, { tool: string; text: string }>();
-  private pendingQuestions = new Map<string, PendingQuestion>();
+  /** Per-user FIFO of interactions; the head is the one shown to the user. */
+  private interactions = new Map<string, PendingInteraction[]>();
+  /** When a user's last interaction expired unanswered (timeout / cancel), for late-reply hints. */
+  private expiredInteractions = new Map<string, number>();
+  /** "本会话总是允许" grants: `${uid}:${tool}` → rule keys (see permissionRuleKey). Memory only. */
+  private sessionGrants = new Map<string, Set<string>>();
   private _lastSessionList: Array<{ id: string; date: string; summary: string }> | null = null;
   private readonly tasks: InboundTaskStore;
   private readonly bootId: string;
@@ -150,10 +182,11 @@ export class Router {
       if (!seen.has(task.abort)) { seen.add(task.abort); task.abort.abort(); }
     }
     this.active.clear();
-    for (const pending of this.pendingQuestions.values()) {
-      clearTimeout(pending.timeout);
+    // Settle every waiter (approvals reject, questions throw) so no adapter is left hanging.
+    for (const queue of [...this.interactions.values()]) {
+      for (const pending of [...queue]) pending.expire('stopped');
     }
-    this.pendingQuestions.clear();
+    this.interactions.clear();
   }
 
   private resolveToolFromRefText(refText: string): string | undefined {
@@ -810,6 +843,11 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
       return;
     }
 
+    // ── A waiting AskUser question / tool approval takes the reply before anything else ──
+    if (trimmed && await this.answerInteraction(uid, trimmed)) return;
+    const staleHint = trimmed ? this.staleAnswerHint(uid, trimmed) : undefined;
+    if (staleHint) { await this.ilink.sendText(uid, staleHint, { priority: 'control' }); return; }
+
     // ── Parse: @tool1>tool2 chain, @tool single, >> relay, plain text ──
 
     // Pattern: @tool1>tool2 prompt  →  chain: tool1 processes, output feeds tool2
@@ -852,16 +890,6 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
     }
 
     const toolName = this.getCli(uid, trimmed, refText);
-
-    // ── If a tool is waiting for AskUser reply, resolve it before normal execution ──
-    const pendingKey = `${uid}:${toolName}`;
-    const pending = this.pendingQuestions.get(pendingKey);
-    if (pending && trimmed) {
-      clearTimeout(pending.timeout);
-      this.pendingQuestions.delete(pendingKey);
-      pending.resolve(trimmed);
-      return;
-    }
 
     // ── getCli 决定终端，立即切换 defaultTool ──
     this.sessions.update(uid, { defaultTool: toolName });
@@ -1021,6 +1049,7 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
 
       case 'new': case 'n':
         this.sessions.clearSession(uid);
+        this.clearSessionGrants(uid);
         await reply('新会话');
         return true;
 
@@ -1072,11 +1101,11 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
       case 'mode': {
         const modes: Record<string, string> = { auto: 'auto', safe: 'safe', plan: 'plan' };
         const v = modes[arg.toLowerCase()];
-        if (!v) { await reply('/mode <auto|safe|plan>\nauto=最高权限 safe=需确认 plan=只读'); return true; }
+        if (!v) { await reply('/mode <auto|safe|plan>\nauto=最高权限 safe=每次敏感操作在微信里问你 plan=只读'); return true; }
         this.sessions.update(uid, { mode: v as any });
         const desc: Record<string, string> = {
           auto: 'AUTO\nClaude: --dangerously-skip-permissions\nCodex: --yolo\nGemini: --approval-mode yolo\nKimi: -p (自带auto)',
-          safe: 'SAFE\nClaude: 默认权限\nCodex: --sandbox workspace-write\nGemini: --approval-mode default\nKimi: -p 恒auto (/mode 对Kimi无效)',
+          safe: 'SAFE = 每次敏感操作在微信里问你\n回 1 允许一次 / 2 本会话总是允许此类操作 / 3 拒绝，5 分钟无回复自动拒绝\n(需工具支持审批；Codex: 在 workspace-write 沙箱内执行；Kimi: /mode 无效)',
           plan: 'PLAN\nClaude: --permission-mode plan\nCodex: --sandbox read-only\nGemini: --approval-mode plan\nKimi: -p 不支持plan (恒auto)',
         };
         await reply(desc[v]);
@@ -1086,6 +1115,7 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
       case 'dir': case 'cd':
         if (!arg) { await reply(`当前: ${settings.workDir || this.config.workDir}`); return true; }
         this.sessions.update(uid, { workDir: arg });
+        this.clearSessionGrants(uid);
         await reply(`dir → ${arg}`);
         return true;
 
@@ -1340,6 +1370,7 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
           sessionName: '', ephemeral: false, profile: '', approvalMode: '',
           includeDirs: '', extensions: '', showThoughts: false, msgMode: this.getDefaultMsgMode(),
         } as any);
+        this.clearSessionGrants(uid);
         await reply('所有设置已重置');
         return true;
 
@@ -1373,6 +1404,7 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
       case 'compact': case 'compress': case 'summarize': {
         // Clear session + start fresh with summary instruction
         this.sessions.clearSession(uid);
+        this.clearSessionGrants(uid);
         await reply('会话已压缩 (新session, 旧上下文已清除)');
         return true;
       }
@@ -1494,6 +1526,7 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
 
       case 'clear': {
         this.sessions.clearSession(uid);
+        this.clearSessionGrants(uid);
         this.lastResponse.delete(uid);
         await reply('已清除所有会话和历史');
         return true;
@@ -1834,7 +1867,8 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
 
     const result = await adapter.execute(enhancedPrompt, {
       settings, workDir: this.config.workDir, timeout: this.config.cliTimeout, extraArgs, signal,
-      askUser: (req) => this.askUserViaWeChat(uid, toolName, req),
+      askUser: (req) => this.askUserViaWeChat(uid, toolName, req, signal),
+      requestPermission: (req, adapterSignal) => this.requestPermissionViaWeChat(uid, toolName, req, [signal, adapterSignal]),
       media,
       onIntermediate,
     });
@@ -1849,9 +1883,132 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
 
   // ─── Execute single tool ──────────────────────────────
 
-  // ─── AskUserQuestion via WeChat ─────────────────────────
+  // ─── Interactions: AskUser questions and tool approvals via WeChat ───
 
-  private async askUserViaWeChat(uid: string, toolName: string, req: AskUserRequest): Promise<Record<string, string>> {
+  /**
+   * Queue a prompt for the user's reply. The promise always settles: with the parsed answer,
+   * or with `onExpire(why)` on timeout, task cancel (any of `signals`), shutdown, an
+   * undeliverable prompt or a second invalid reply. While it waits the task stays `running`.
+   */
+  private interact<T>(uid: string, spec: {
+    text: string;
+    retryText?: string;
+    parse: (reply: string) => T | undefined;
+    onExpire: (why: InteractionEnd) => T | Error;
+    /** Checked when the interaction reaches the head: a value settles it without a message. */
+    preempt?: () => T | undefined;
+    signals?: Array<AbortSignal | undefined>;
+  }): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+      const signals = (spec.signals || []).filter((s): s is AbortSignal => Boolean(s));
+      let done = false;
+      const finish = (): void => {
+        done = true;
+        clearTimeout(item.timer);
+        for (const s of signals) s.removeEventListener('abort', onAbort);
+        this.dropInteraction(uid, item);
+      };
+      const item: PendingInteraction = {
+        text: spec.text,
+        retryText: spec.retryText,
+        retried: false,
+        preempt: () => {
+          const value = done ? undefined : spec.preempt?.();
+          if (value === undefined) return false;
+          finish();
+          resolve(value);
+          return true;
+        },
+        answer: (reply) => {
+          if (done) return true;
+          const value = spec.parse(reply);
+          if (value === undefined) return false;
+          finish();
+          resolve(value);
+          return true;
+        },
+        expire: (why) => {
+          if (done) return;
+          finish();
+          if (why === 'timeout' || why === 'cancelled') this.expiredInteractions.set(uid, Date.now());
+          const value = spec.onExpire(why);
+          if (value instanceof Error) reject(value); else resolve(value);
+        },
+      };
+      const onAbort = (): void => item.expire('cancelled');
+      if (this.stopping) { item.expire('stopped'); return; }
+      if (signals.some((s) => s.aborted)) { item.expire('cancelled'); return; }
+      for (const s of signals) s.addEventListener('abort', onAbort, { once: true });
+      const queue = this.interactions.get(uid);
+      if (queue) { queue.push(item); return; }
+      this.interactions.set(uid, [item]);
+      this.showInteraction(uid, item);
+    });
+  }
+
+  /** Send the head interaction and arm its timeout. Control priority: never squeezed out by
+   *  streamed intermediate/activity output, and it does not eat into the final reserve. */
+  private showInteraction(uid: string, item: PendingInteraction): void {
+    if (item.preempt()) return;
+    item.timer = setTimeout(() => item.expire('timeout'), INTERACTION_TIMEOUT_MS);
+    this.ilink.sendText(uid, item.text, { priority: 'control' }).catch((err) => {
+      if (isDeliveryFinalizationError(err)) return; // delivered; only local bookkeeping failed
+      log.error('[interaction] 无法发送提问/审批消息:', err);
+      item.expire('unsent');
+    });
+  }
+
+  private dropInteraction(uid: string, item: PendingInteraction): void {
+    const queue = this.interactions.get(uid);
+    const index = queue?.indexOf(item) ?? -1;
+    if (!queue || index < 0) return;
+    queue.splice(index, 1);
+    if (queue.length === 0) this.interactions.delete(uid);
+    else if (index === 0 && !this.stopping) this.showInteraction(uid, queue[0]);
+  }
+
+  /** Route a reply to the head interaction. True when the reply was consumed. */
+  private async answerInteraction(uid: string, reply: string): Promise<boolean> {
+    const head = this.interactions.get(uid)?.[0];
+    if (!head) return false;
+    if (head.answer(reply)) return true;
+    if (head.retryText && !head.retried) {
+      head.retried = true;
+      await this.ilink.sendText(uid, head.retryText, { priority: 'control' });
+    } else {
+      head.expire('invalid');
+    }
+    return true;
+  }
+
+  /**
+   * A bare "1"/"2"/"3" with nothing waiting is almost certainly a late answer — to a prompt that
+   * timed out or was cancelled, or one a restart killed (the CLI that asked is gone, so the
+   * question is not persisted; its task shows up as recovery-required). Say so instead of
+   * sending "1" to an Agent as a new prompt.
+   */
+  private staleAnswerHint(uid: string, text: string): string | undefined {
+    if (!BARE_ANSWER.test(text)) return undefined;
+    const now = Date.now();
+    const expiredAt = this.expiredInteractions.get(uid);
+    if (expiredAt !== undefined && now - expiredAt < STALE_ANSWER_WINDOW_MS) {
+      this.expiredInteractions.delete(uid);
+      return '没有正在等待回复的提问或审批：上一个已超时或已取消（审批按拒绝处理）。\n如需继续，请重新发送完整指令。';
+    }
+    const interrupted = this.tasks.list({ userId: uid, phases: ['recovery-required'] }).some((task) =>
+      task.recovery?.reason === 'agent-interrupted'
+      && task.recovery.detectedByBootId === this.bootId
+      && now - task.recovery.at < STALE_ANSWER_WINDOW_MS);
+    if (!interrupted) return undefined;
+    return '没有正在等待回复的提问或审批：桥接服务刚重启，重启前的提问/审批已随 CLI 进程结束而失效（/tasks 查看中断的任务）。\n如需继续，请重新发送完整指令。';
+  }
+
+  private async askUserViaWeChat(
+    uid: string,
+    toolName: string,
+    req: AskUserRequest,
+    signal?: AbortSignal,
+  ): Promise<Record<string, string>> {
     const adapter = this.registry.get(toolName);
     const displayName = adapter?.displayName ?? toolName;
 
@@ -1867,16 +2024,12 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
     }
     lines.push(`— ${displayName} | 等待回复`);
 
-    await this.ilink.sendText(uid, lines.join('\n'));
-
-    // Wait for user reply (timeout 5 min); key: "${uid}:${toolName}" for concurrent support
-    const pendingKey = `${uid}:${toolName}`;
-    const reply = await new Promise<string>((resolve, reject) => {
-      const timeout = setTimeout(() => {
-        this.pendingQuestions.delete(pendingKey);
-        reject(new Error('回复超时'));
-      }, 300_000);
-      this.pendingQuestions.set(pendingKey, { resolve, timeout, toolName });
+    // Free-form answers are valid, so there is no retry; timeout / cancel throw (the adapter denies).
+    const reply = await this.interact<string>(uid, {
+      text: lines.join('\n'),
+      parse: (text) => text,
+      onExpire: (why) => new Error(why === 'timeout' ? '回复超时' : why === 'cancelled' ? '已取消' : '未回复'),
+      signals: [signal],
     });
 
     // Parse reply → map to question answers
@@ -1900,6 +2053,77 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
 
     log.debug(`[askUser] answers: ${JSON.stringify(answers)}`);
     return answers;
+  }
+
+  /**
+   * Tool approval in `safe` mode: 1 = allow once, 2 = allow this kind of operation for the rest
+   * of the session, 3 = reject. Resolves to the chosen option id; null (= reject) on timeout,
+   * cancel, shutdown or a second invalid reply.
+   *
+   * "2" is a bridge-side grant, never the agent's allow_always: Claude persists that one into
+   * the project's .claude/settings.local.json, and every turn is a fresh CLI process anyway. We
+   * remember (user, tool, rule key) in memory and answer allow_once for it from then on.
+   */
+  private requestPermissionViaWeChat(
+    uid: string,
+    toolName: string,
+    req: PermissionRequest,
+    signals: Array<AbortSignal | undefined>,
+  ): Promise<string | null> {
+    const displayName = this.registry.get(toolName)?.displayName ?? toolName;
+    const byKind = (kind: string) => req.options.find((option) => option.kind === kind);
+    const allow = (byKind('allow_once') ?? byKind('allow_always'))?.id;
+    const grantKey = `${uid}:${toolName}`;
+    const rule = permissionRuleKey(req);
+    const title = req.title.length > 300 ? `${req.title.slice(0, 300)}…` : req.title;
+    const granted = (): string | undefined => {
+      if (!allow || !this.sessionGrants.get(grantKey)?.has(rule)) return undefined;
+      log.info(`[approval] ${toolName} ${title} → ${allow} (本会话已允许 ${rule})`);
+      return allow;
+    };
+    const auto = granted();
+    if (auto) return Promise.resolve(auto);
+
+    const choices = new Map<string, string | null>();
+    const lines: string[] = [];
+    const once = byKind('allow_once');
+    if (once) { choices.set('1', once.id); lines.push('1. 允许一次'); }
+    if (allow) { choices.set('2', allow); lines.push(`2. 本会话总是允许此类操作（${rule}）`); }
+    choices.set('3', (byKind('reject_once') ?? byKind('reject_always'))?.id ?? null);
+    lines.push('3. 拒绝');
+    return this.interact<string | null>(uid, {
+      text: `${displayName} 请求权限：${title}\n${lines.join('\n')}\n— 回复数字；5 分钟无回复自动拒绝`,
+      retryText: `请回复 ${[...choices.keys()].join('/')}（${displayName} 请求权限：${title}）\n再次无效将自动拒绝`,
+      // A grant made while this request sat in the queue answers it without a message.
+      preempt: granted,
+      parse: (reply) => {
+        const key = reply.trim();
+        const choice = choices.get(key);
+        if (choice === undefined) return undefined;
+        if (key === '2') {
+          const rules = this.sessionGrants.get(grantKey) ?? new Set<string>();
+          this.sessionGrants.set(grantKey, rules.add(rule));
+        }
+        log.info(`[approval] ${toolName} ${title} → ${choice ?? 'reject'}${key === '2' ? ` (本会话允许 ${rule})` : ''}`);
+        return choice;
+      },
+      onExpire: (why) => {
+        log.info(`[approval] ${toolName} ${title} → reject (${why})`);
+        if (why === 'invalid') {
+          this.ilink.sendText(uid, `未识别的回复，已拒绝：${title}`, { priority: 'control' })
+            .catch((err) => log.error('[approval] 无法发送拒绝提示:', err));
+        }
+        return null;
+      },
+      signals,
+    });
+  }
+
+  /** "本会话" ends with /new, /clear, a workDir change or a restart (grants are memory-only). */
+  private clearSessionGrants(uid: string): void {
+    for (const key of [...this.sessionGrants.keys()]) {
+      if (key.startsWith(`${uid}:`)) this.sessionGrants.delete(key);
+    }
   }
 
   private async exec(
@@ -2092,6 +2316,14 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
       this.active.delete(`${uid}:${toolName}`);
     }
   }
+}
+
+/** Grant granularity: the agent's tool kind (execute / edit / fetch …), else the tool name that
+ *  leads the title ("Bash: npm test" → "Bash"), else the whole title. */
+function permissionRuleKey(req: PermissionRequest): string {
+  if (req.kind) return req.kind;
+  const head = req.title.split(':')[0].trim();
+  return head || req.title.trim() || 'tool';
 }
 
 function errorMessage(err: unknown): string {
