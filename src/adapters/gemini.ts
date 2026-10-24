@@ -122,14 +122,21 @@ export class GeminiAdapter implements CLIAdapter {
     parts.push(...notices);
 
     const errText = [...run.errors, run.stderr].join('\n');
+    const sessionExpired = error && !!sid && isSessionError(errText);
+    // Never echo the stored sid back on failure: the router clears an expired session and then
+    // persists result.sessionId, which would resurrect the dead id. On error only a session the
+    // CLI itself reported via init counts. Our pre-chosen ID is adopted only once init was seen,
+    // so a startup failure (auth, bad flag) never leaves a dangling ID to resume.
+    let sessionId: string | undefined;
+    if (sessionExpired) sessionId = undefined;
+    else if (error) sessionId = run.sessionId;
+    else sessionId = run.sessionId || sid || (run.sawInit ? newId : undefined);
     return {
       text: parts.join('\n\n') || '(无输出)',
-      // Only adopt our pre-chosen ID if the CLI actually got as far as starting the session;
-      // otherwise a startup failure (auth, bad flag) would leave a dangling ID to resume.
-      sessionId: run.sessionId || sid || (run.sawInit ? newId : undefined),
+      sessionId,
       duration: run.duration,
       error,
-      sessionExpired: error && !!sid && isSessionError(errText),
+      sessionExpired,
     };
   }
 

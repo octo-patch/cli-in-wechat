@@ -164,7 +164,20 @@ test('Gemini resume failure marks the session expired', async () => {
   });
   assert.equal(result.error, true);
   assert.equal(result.sessionExpired, true);
+  // Router clears then persists result.sessionId — echoing the dead id back would loop forever.
+  assert.equal(result.sessionId, undefined);
   assert.match(result.text, /Invalid session identifier/);
+});
+
+test('Gemini non-session failure on a resumed session does not echo the stored id', async () => {
+  const fake = createFakeSpawn([{ stderr: '[API Error: quota exceeded (Status: RESOURCE_EXHAUSTED)]', code: 1 }]);
+  const result = await new GeminiAdapter(fake.spawn).execute('p', {
+    settings: settings({ sessionIds: { gemini: 'ses-keep' } }),
+  });
+  assert.equal(result.error, true);
+  assert.equal(result.sessionExpired, false);
+  assert.equal(result.sessionId, undefined);
+  assert.match(result.text, /配额已用尽/);
 });
 
 test('Gemini /mode maps to approval modes; explicit approvalMode wins', async () => {
@@ -232,6 +245,7 @@ test('Gemini model-not-found and quota errors keep friendly hints', async () => 
   const q = createFakeSpawn([{ stdout: [quota], code: 1 }]);
   const r2 = await new GeminiAdapter(q.spawn).execute('p', { settings: settings() });
   assert.equal(r2.error, true);
+  assert.equal(r2.sessionId, 's', 'a session the CLI reported via init is still adopted on error');
   assert.match(r2.text, /配额已用尽/);
 });
 
