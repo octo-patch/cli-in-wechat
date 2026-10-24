@@ -82,6 +82,16 @@ export interface AskUserRequest {
   }>;
 }
 
+/** A tool-permission prompt raised by an agent (today: ACP `session/request_permission`). */
+export interface PermissionRequest {
+  /** Human-readable description of the tool call, e.g. "Run `npm test`". */
+  title: string;
+  /** Tool kind when the agent reports one (read / edit / execute / fetch …). */
+  kind?: string;
+  /** Choices offered by the agent; `kind` is allow_once | allow_always | reject_once | reject_always. */
+  options: Array<{ id: string; name: string; kind: string }>;
+}
+
 export interface ExecOptions {
   settings: UserSettings;
   workDir?: string;
@@ -89,6 +99,9 @@ export interface ExecOptions {
   extraArgs?: string[];
   signal?: AbortSignal;
   askUser?: (req: AskUserRequest) => Promise<Record<string, string>>;
+  /** Ask the user to approve a tool call in `safe` mode. Resolves to the chosen option id, or
+   *  null to reject. When absent, adapters reject on their own (and say so in the reply). */
+  requestPermission?: (req: PermissionRequest, signal?: AbortSignal) => Promise<string | null>;
   media?: DownloadedMedia[];
   /** Callback for streaming intermediate messages to WeChat */
   onIntermediate?: (msg: IntermediateMessage) => void;
@@ -99,6 +112,8 @@ export interface ExecResult {
   thinking?: string;
   sessionId?: string;
   cost?: number;
+  /** Token usage reported by the CLI for this run, when it reports one. */
+  usage?: { inputTokens: number; outputTokens: number; cacheReadTokens?: number; cacheWriteTokens?: number };
   duration?: number;
   error?: boolean;
   /** Set by the adapter when the error is positively identified as a session/resume failure. */
