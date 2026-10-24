@@ -115,12 +115,9 @@ export function createSendFileMarkerStripper(): (text: string) => string {
   };
 }
 
-const TOOL_ALIASES: Record<string, string> = {
-  claude: 'claude', cc: 'claude',
-  codex: 'codex', cx: 'codex',
-  gemini: 'gemini', gm: 'gemini',
-  kimi: 'kimi', km: 'kimi',
-  opencode: 'opencode', oc: 'opencode',
+/** Two-letter shortcuts for the built-in tools (/cc, @cx …). Any other tool goes by its registry name. */
+const SHORT_ALIASES: Record<string, string> = {
+  cc: 'claude', cx: 'codex', gm: 'gemini', km: 'kimi', oc: 'opencode',
 };
 
 const NORMAL_ACTIVITY_MAX_LINES_PER_MESSAGE = 12;
@@ -208,11 +205,64 @@ export class Router {
     return undefined;
   }
 
+  /**
+   * Registry name for what the user typed: a two-letter shortcut, a registered tool name
+   * (built-in, ACP preset or config agent — whatever the registry holds) or its display name.
+   */
+  private resolveToolName(raw: string): string | undefined {
+    const typed = raw.trim();
+    const lower = typed.toLowerCase();
+    if (SHORT_ALIASES[lower]) return SHORT_ALIASES[lower];
+    if (this.registry.getAll().some((adapter) => adapter.name === lower)) return lower;
+    const byDisplay = this.registry.getAll().find((adapter) => adapter.displayName.toLowerCase() === lower);
+    return byDisplay ? this.registry.getNameByDisplayName(byDisplay.displayName) : undefined;
+  }
+
+  /** Installed tools in registry order, one entry per tool (an SDK → CLI fallback is not listed twice). */
+  private availableTools(): Array<{ name: string; displayName: string; short?: string }> {
+    const shortFor = new Map(Object.entries(SHORT_ALIASES).map(([short, name]) => [name, short]));
+    const order = this.registry.getAll().map((adapter) => adapter.name);
+    const rank = (name: string) => (order.includes(name) ? order.indexOf(name) : order.length);
+    return this.registry.getAvailableNames()
+      .map((name) => ({ name, displayName: this.registry.get(name)?.displayName ?? name, short: shortFor.get(name) }))
+      .filter((tool) => (this.registry.getNameByDisplayName(tool.displayName) ?? tool.name) === tool.name)
+      .sort((a, b) => rank(a.name) - rank(b.name));
+  }
+
+  private availableToolList(): string {
+    return this.availableTools().map((tool) => tool.name).join(', ') || '无';
+  }
+
+  /** Why `@a>b` can't run (unknown or uninstalled tool), or undefined when both are usable. */
+  private chainProblem(rawA: string, rawB: string): string | undefined {
+    for (const raw of [rawA, rawB]) {
+      const name = this.resolveToolName(raw);
+      if (!name) return `未知终端: @${raw}，链式调用未执行\n可用: ${this.availableToolList()}`;
+      if (!this.registry.isAvailable(name)) return `"${name}" 未安装或不可用，链式调用未执行\n可用: ${this.availableToolList()}`;
+    }
+    return undefined;
+  }
+
+  /** /use, /cc …: switch the default tool when it is installed. */
+  private async switchTool(uid: string, raw: string): Promise<void> {
+    const name = this.resolveToolName(raw);
+    if (!name) {
+      await this.ilink.sendText(uid, `未知工具: ${raw}\n可用: ${this.availableToolList()}`);
+      return;
+    }
+    if (!this.registry.isAvailable(name)) {
+      await this.ilink.sendText(uid, `"${name}" 未安装或不可用\n可用: ${this.availableToolList()}`);
+      return;
+    }
+    this.sessions.update(uid, { defaultTool: name });
+    await this.ilink.sendText(uid, `→ ${name}`);
+  }
+
   // ── getCli: determine terminal from @mention → ref footer → current session ──
   private getCli(uid: string, text: string, refText?: string): string {
-    const atMatch = text.match(/^@(\w+)/);
+    const atMatch = text.match(/^@([\w-]+)/);
     if (atMatch) {
-      const resolved = TOOL_ALIASES[atMatch[1].toLowerCase()];
+      const resolved = this.resolveToolName(atMatch[1]);
       if (resolved && this.registry.isAvailable(resolved)) return resolved;
     }
     if (refText) {
@@ -863,17 +913,20 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
     // ── Parse: @tool1>tool2 chain, @tool single, >> relay, plain text ──
 
     // Pattern: @tool1>tool2 prompt  →  chain: tool1 processes, output feeds tool2
-    const chainMatch = trimmed.match(/^@(\w+)>(\w+)\s+([\s\S]+)$/);
+    const chainMatch = trimmed.match(/^@([\w-]+)>([\w-]+)(?:\s+([\s\S]*))?$/);
     if (chainMatch) {
-      const t1 = TOOL_ALIASES[chainMatch[1].toLowerCase()];
-      const t2 = TOOL_ALIASES[chainMatch[2].toLowerCase()];
-      const prompt = chainMatch[3].trim();
-      if (t1 && t2 && this.registry.isAvailable(t1) && this.registry.isAvailable(t2)) {
-        const busy = [t1, t2].find(t => this.active.has(`${uid}:${t}`));
-        if (busy) { await this.ilink.sendText(uid, this.busyText(uid, busy)); return; }
-        await this.chain(uid, t1, t2, prompt + mediaContext, media, taskGeneration, run);
-        return;
-      }
+      // A chain that can't run as written is refused: falling back to one tool (or the default)
+      // would run the prompt somewhere the user didn't send it.
+      const problem = this.chainProblem(chainMatch[1], chainMatch[2]);
+      if (problem) { await this.ilink.sendText(uid, problem); return; }
+      const prompt = (chainMatch[3] ?? '').trim();
+      if (!prompt) { await this.ilink.sendText(uid, `用法: @${chainMatch[1]}>${chainMatch[2]} <内容>`); return; }
+      const t1 = this.resolveToolName(chainMatch[1])!;
+      const t2 = this.resolveToolName(chainMatch[2])!;
+      const busy = [t1, t2].find(t => this.active.has(`${uid}:${t}`));
+      if (busy) { await this.ilink.sendText(uid, this.busyText(uid, busy)); return; }
+      await this.chain(uid, t1, t2, prompt + mediaContext, media, taskGeneration, run);
+      return;
     }
 
     // Pattern: >> prompt  →  relay: prepend last response as context
@@ -884,7 +937,7 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
         await this.ilink.sendText(uid, '没有上一条回复可接力');
         return;
       }
-      const atRelayMatch = rest.match(/^@(\w+)[\s：:]\s*([\s\S]+)$/);
+      const atRelayMatch = rest.match(/^@([\w-]+)[\s：:]\s*([\s\S]+)$/);
       const prompt = atRelayMatch ? atRelayMatch[2].trim() : rest;
       const toolName = this.getCli(uid, rest, refText);
       this.sessions.update(uid, { defaultTool: toolName });
@@ -895,9 +948,15 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
     }
 
     // ── @mention 合法性校验 ──
-    const atMatch = trimmed.match(/^@(\w+)(?:[\s：:]\s*([\s\S]+))?$/);
-    if (atMatch && !TOOL_ALIASES[atMatch[1].toLowerCase()]) {
-      await this.ilink.sendText(uid, `未知终端: @${atMatch[1]}\n可用: ${Object.keys(TOOL_ALIASES).join(', ')}`);
+    const atMatch = trimmed.match(/^@([\w-]+)(?:[\s：:]\s*([\s\S]+))?$/);
+    const mentioned = atMatch ? this.resolveToolName(atMatch[1]) : undefined;
+    if (atMatch && !mentioned) {
+      await this.ilink.sendText(uid, `未知终端: @${atMatch[1]}\n可用: ${this.availableToolList()}`);
+      return;
+    }
+    if (mentioned && !this.registry.isAvailable(mentioned)) {
+      // Never fall back to the default tool: the prompt was addressed to someone else.
+      await this.ilink.sendText(uid, `"${mentioned}" 未安装或不可用\n可用: ${this.availableToolList()}`);
       return;
     }
 
@@ -907,7 +966,7 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
     this.sessions.update(uid, { defaultTool: toolName });
 
     if (!this.registry.isAvailable(toolName)) {
-      await this.ilink.sendText(uid, `"${toolName}" 不可用\n可用: ${this.registry.getAvailableNames().join(', ')}`);
+      await this.ilink.sendText(uid, `"${toolName}" 不可用\n可用: ${this.availableToolList()}`);
       return;
     }
 
@@ -938,7 +997,9 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
       // 通用
       // ═══════════════════════════════════════════
 
-      case 'help': case 'h':
+      case 'help': case 'h': {
+        const tools = this.availableTools();
+        const shortcuts = tools.filter((tool) => tool.short).map((tool) => `/${tool.short}`).join(' ');
         await reply([
           '=== cli-in-wechat 命令 ===',
           '',
@@ -992,14 +1053,16 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
           '/yolo  auto+effort max',
           '/fast  effort low',
           '/reset  重置所有设置',
-          '/cc /cx /gm /km /oc  切工具',
+          `/use [名字]  切工具/列出可用 (${tools.map((tool) => tool.name).join(' ') || '无'})`,
+          ...(shortcuts ? [`${shortcuts}  快捷切换`] : []),
           '',
           '— 发消息 —',
-          '@claude/@codex/@gemini/@kimi/@opencode  指定工具',
+          '@<工具名>  单次指定工具',
           '>>  接力(传上条结果)',
           '@tool1>tool2  链式调用',
         ].join('\n'));
         return true;
+      }
 
       case 'status': case 'st': {
         const def = settings.defaultTool || this.config.defaultTool;
@@ -1007,7 +1070,7 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
         const defaultMsgMode = this.getDefaultMsgMode();
         const sids = Object.entries(settings.sessionIds).map(([k, v]) => `${k}:${String(v).substring(0, 8)}`).join(' ') || '无';
         const lines = [
-          `工具: ${def}`,
+          `工具: ${def}${this.registry.get(def)?.displayName ? ` (${this.registry.get(def)!.displayName})` : ''}`,
           `模式: ${settings.mode}`,
           `effort: ${settings.effort}`,
           `model: ${settings.model || '默认'}`,
@@ -1021,7 +1084,7 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
           `system: ${settings.systemPrompt ? settings.systemPrompt.substring(0, 40) + '...' : '无'}`,
           `dir: ${settings.workDir || this.config.workDir}`,
           `会话: ${sids}`,
-          `可用: ${this.registry.getAvailableNames().join(', ')}`,
+          `可用: ${this.availableToolList()}`,
         ];
         const getDeliveryStatus = (this.ilink as ILinkClient & {
           getDeliveryStatus?: (userId: string) => {
@@ -1619,16 +1682,20 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
       // 工具切换
       // ═══════════════════════════════════════════
 
-      case 'claude': case 'cc':
-        this.sessions.update(uid, { defaultTool: 'claude' }); await reply('→ claude'); return true;
-      case 'codex': case 'cx':
-        this.sessions.update(uid, { defaultTool: 'codex' }); await reply('→ codex'); return true;
-      case 'gemini': case 'gm':
-        this.sessions.update(uid, { defaultTool: 'gemini' }); await reply('→ gemini'); return true;
-      case 'kimi': case 'km':
-        this.sessions.update(uid, { defaultTool: 'kimi' }); await reply('→ kimi'); return true;
-      case 'opencode': case 'oc':
-        this.sessions.update(uid, { defaultTool: 'opencode' }); await reply('→ opencode'); return true;
+      case 'use': case 'u': {
+        if (arg) { await this.switchTool(uid, arg); return true; }
+        const current = settings.defaultTool || this.config.defaultTool;
+        const tools = this.availableTools();
+        if (tools.length === 0) { await reply('本机没有检测到可用的 CLI 工具'); return true; }
+        const lines = tools.map((tool) =>
+          `${tool.name === current ? '▶' : '  '} ${tool.name}  ${tool.displayName}${tool.short ? ` (/${tool.short})` : ''}`);
+        await reply(`可用工具 (当前: ${current}):\n${lines.join('\n')}\n\n/use <名字> 切换，@<名字> 单次指定`);
+        return true;
+      }
+      case 'claude': case 'cc': case 'codex': case 'cx': case 'gemini': case 'gm':
+      case 'kimi': case 'km': case 'opencode': case 'oc':
+        await this.switchTool(uid, cmd);
+        return true;
 
       // ═══════════════════════════════════════════
       // 未识别
@@ -2031,8 +2098,8 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
     const head = this.interactions.get(uid)?.[0];
     if (!head?.delivered) return false;
     let reply = text;
-    const at = text.match(/^@(\w+)(?:[\s：:]+([\s\S]*))?$/);
-    const mentioned = at ? this.mentionedTool(at[1]) : undefined;
+    const at = text.match(/^@([\w-]+)(?:[\s：:]+([\s\S]*))?$/);
+    const mentioned = at ? this.resolveToolName(at[1]) : undefined;
     if (mentioned) {
       if (mentioned !== head.toolName) return false;
       reply = (at![2] || '').trim();
@@ -2047,11 +2114,6 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
       head.expire('invalid');
     }
     return true;
-  }
-
-  /** Registry name behind an @mention, or undefined when it names no tool. */
-  private mentionedTool(name: string): string | undefined {
-    return TOOL_ALIASES[name.toLowerCase()];
   }
 
   /** The "<tool> 在忙" reply, saying so explicitly when the tool is waiting on the user. */

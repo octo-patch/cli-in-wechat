@@ -109,6 +109,7 @@ function boot(dir: string, options: BootOptions) {
     isAvailable: (name: string) => name === 'codex',
     getNameByDisplayName: () => undefined,
     getAvailableNames: () => ['codex'],
+    getAll: () => [{ name: 'codex', displayName: 'Codex' }],
     get: (name: string) => (name === 'codex' ? {
       name: 'codex',
       displayName: 'Codex',

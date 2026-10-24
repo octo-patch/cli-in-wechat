@@ -66,6 +66,7 @@ function createRouter(adapters: Record<string, Execute>) {
     isAvailable: (name: string) => names.includes(name),
     getNameByDisplayName: (display: string) => names.find((name) => displayName(name) === display),
     getAvailableNames: () => names,
+    getAll: () => names.map((name) => ({ name, displayName: displayName(name) })),
     get: (name: string) => (adapters[name] ? {
       name,
       displayName: displayName(name),
@@ -482,6 +483,7 @@ function boot(dir: string, bootId: string, execute: Execute, maxItemsPerWindow =
     isAvailable: (name: string) => name === 'claude',
     getNameByDisplayName: () => undefined,
     getAvailableNames: () => ['claude'],
+    getAll: () => [{ name: 'claude', displayName: 'Claude' }],
     get: (name: string) => (name === 'claude' ? {
       name: 'claude',
       displayName: 'Claude',
@@ -802,4 +804,21 @@ test('C: a question still queued in the outbox does not swallow the next message
   await reply('1');
   await run;
   assert.deepEqual(answers, { 'Proceed?': 'yes' });
+});
+
+test('a pending prompt resolves @mentions like routing does: config agents with dashes and shortcuts', async () => {
+  const results: Array<string | null> = [];
+  const { router, calls, approvals, reply } = createRouter({
+    claude: approvingAdapter(results),
+    'my-agent': async () => ({ text: 'ok' }),
+  });
+  const run = router.exec('u1', 'claude', 'do it');
+  await waitFor(() => approvals().length === 1);
+  await reply('@my-agent 1');
+  await router.whenIdle();
+  assert.deepEqual(calls, ['claude:do it', 'my-agent:1'], '"1" went to my-agent, not to the approval');
+  assert.deepEqual(results, []);
+  await reply('@cc 1'); // the asking tool by its shortcut
+  await run;
+  assert.deepEqual(results, ['opt-once']);
 });
