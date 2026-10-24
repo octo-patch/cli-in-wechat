@@ -131,7 +131,7 @@ test('non-image media still goes through the text prompt', async () => {
   assert.deepEqual(fake.capture.args!.slice(-2), ['--image', '/m/c.png']);
 });
 
-test('item events map to intermediate messages; final answer is the last agent_message', async () => {
+test('item events map to intermediate messages; every agent_message streams; final answer is the last one', async () => {
   const fake = createFakeSpawn(jsonl([
     { type: 'thread.started', thread_id: 'thr_ev' },
     { type: 'item.completed', item: { id: 'w', type: 'error', message: 'clamping hook timeout' } },
@@ -166,6 +166,7 @@ test('item events map to intermediate messages; final answer is the last agent_m
     { type: 'tool_use', toolName: 'WebSearch', content: '- WebSearch: `codex json`' },
     { type: 'tool_use', toolName: 'TodoWrite', content: '- TodoWrite: 0/2' },
     { type: 'tool_use', toolName: 'TodoWrite', content: '- TodoWrite: 1/2' },
+    { type: 'text', content: 'Done: 你好' },
   ]);
   assert.equal(result.text, 'Done: 你好');
   assert.equal(result.thinking, 'thinking hard');

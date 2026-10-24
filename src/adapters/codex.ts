@@ -87,19 +87,16 @@ export interface CodexParseState {
   usage?: Record<string, number>;
 }
 
-/** Incremental JSONL parser: feed lines as they arrive, read state at the end. Intermediate
- *  agent messages are streamed as `text`; the last one is held back as the final answer. */
+/** Incremental JSONL parser: feed lines as they arrive, read state at the end. Every completed
+ *  agent message is streamed as `text` right away (the router then only sends a footer); the
+ *  last one is also returned as the final answer for compact mode / non-streaming callers. */
 export function createCodexParser(onIntermediate?: (msg: IntermediateMessage) => void) {
   const state: CodexParseState = { text: '', thinking: '', error: false, errorText: '' };
   const seen = new Set<string>();
-  let pendingText = '';
+  let lastText = '';
   let lastTodo = '';
 
   const emit = (msg: IntermediateMessage) => { if (onIntermediate && msg.content) onIntermediate(msg); };
-  const flushPending = () => {
-    if (pendingText) emit({ type: 'text', content: pendingText });
-    pendingText = '';
-  };
   const fail = (message: string | undefined) => {
     state.error = true;
     if (message && !state.errorText.includes(message)) state.errorText = state.errorText ? `${state.errorText}\n${message}` : message;
@@ -110,8 +107,8 @@ export function createCodexParser(onIntermediate?: (msg: IntermediateMessage) =>
     switch (item.type) {
       case 'agent_message':
         if (!done || !item.text) return;
-        flushPending();
-        pendingText = item.text;
+        lastText = item.text;
+        emit({ type: 'text', content: item.text });
         return;
       case 'reasoning':
         if (!done || !item.text?.trim()) return;
@@ -124,7 +121,6 @@ export function createCodexParser(onIntermediate?: (msg: IntermediateMessage) =>
         return;
     }
 
-    flushPending();
     switch (item.type) {
       case 'command_execution': {
         if (!seen.has(item.id)) {
@@ -192,8 +188,7 @@ export function createCodexParser(onIntermediate?: (msg: IntermediateMessage) =>
   };
 
   const finish = (): CodexParseState => {
-    state.text = pendingText;
-    pendingText = '';
+    state.text = lastText;
     return state;
   };
 
