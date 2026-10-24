@@ -1,6 +1,6 @@
 import { log } from '../utils/logger.js';
 import { DEFAULT_CLI_TIMEOUT } from '../config.js';
-import type { CLIAdapter, ExecOptions, ExecResult, AdapterCapabilities, IntermediateMessage } from './base.js';
+import type { CLIAdapter, ExecOptions, ExecResult, AdapterCapabilities, IntermediateMessage, AskUserRequest, PermissionRequest } from './base.js';
 import { commandExists, spawnProc, setupAbort, setupTimeout, stripAnsi, summarizeToolUse, summarizeToolResult } from './base.js';
 import type { DownloadedMedia } from '../utils/media.js';
 import { copyMediaToWorkDir } from '../utils/media.js';
@@ -141,6 +141,12 @@ async function connectOrStartClient(): Promise<OpencodeSdkClient> {
     log.warn(`[opencode/sdk] no server on :4096 (${(err as Error).message}), starting own server`);
   }
 
+  // `createOpencode()` spawns whatever `opencode` is on PATH. The V2 installer (brew,
+  // `@opencode/cli`) replaces that command, and a V2 `serve` never prints the V1 ready
+  // line, so the spawn would only fail with an opaque startup timeout.
+  const cliVersion = localCliVersion();
+  if (majorVersion(cliVersion) >= 2) throw new Error(v2Message(cliVersion));
+
   try {
     const { client, server } = await createOpencode();
     sharedServerClose = () => server.close();
@@ -174,6 +180,118 @@ function dirQuery(workDir?: string): { directory: string } | undefined {
   return workDir ? { directory: workDir } : undefined;
 }
 
+/**
+ * The root `@opencode-ai/sdk` entry predates the 1.19 server routes this adapter now
+ * needs (`/permission/{id}/reply`, `/question/{id}/*`, `/global/health`). They are
+ * reached through the client's own transport — same base URL, fetch and interceptors —
+ * rather than pulling in the whole `/v2` client with its different call convention.
+ */
+type RawTransport = {
+  get(options: Record<string, unknown>): Promise<{ data?: unknown }>;
+  post(options: Record<string, unknown>): Promise<{ data?: unknown }>;
+};
+
+function transport(client: OpencodeSdkClient): RawTransport | undefined {
+  const raw = (client as unknown as { _client?: RawTransport })._client;
+  return raw && typeof raw.post === 'function' ? raw : undefined;
+}
+
+function postJson(client: OpencodeSdkClient, url: string, options: Record<string, unknown>): Promise<unknown> {
+  const raw = transport(client);
+  if (!raw) return Promise.reject(new Error(`client cannot reach ${url}`));
+  return raw.post({ url, ...options, throwOnError: true, headers: { 'Content-Type': 'application/json' } });
+}
+
+function majorVersion(version: string | undefined): number {
+  const match = /(\d+)\.\d+/.exec(version || '');
+  return match ? Number(match[1]) : 0;
+}
+
+function v2Message(version: string | undefined): string {
+  return `检测到 OpenCode V2（${version || '2.x'}），它的 server API 与本适配器（OpenCode V1 SDK）不兼容。`
+    + '请安装 V1：npm i -g opencode-ai@1，并确认 PATH 里的 opencode 是 1.x（或在 :4096 运行 1.x 的 opencode serve）；V2 支持需等待 ACP 适配器。';
+}
+
+function localCliVersion(): string | undefined {
+  try {
+    return execSync('opencode --version', {
+      encoding: 'utf8',
+      timeout: 5000,
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim();
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * The server version, from V1's `/global/health` or, failing that, V2's `/api/info`
+ * (the probe `@opencode/client` 2.x itself uses). Undefined for servers too old to
+ * report one, which are V1 by definition.
+ */
+async function serverVersion(client: OpencodeSdkClient): Promise<string | undefined> {
+  const raw = transport(client);
+  if (!raw) return undefined;
+  for (const url of ['/global/health', '/api/info']) {
+    try {
+      const result = await raw.get({ url, throwOnError: true });
+      const version = (result?.data as { version?: unknown } | undefined)?.version;
+      if (typeof version === 'string') return version;
+    } catch { /* route not served by this generation */ }
+  }
+  return undefined;
+}
+
+// A V2 server accepts the connection, then answers none of the V1 routes, so every turn
+// sat silent until the one-hour timeout. Checked once per client; a failed check is not
+// cached, so swapping the server out does not need a bridge restart.
+const serverChecks = new WeakMap<object, Promise<void>>();
+
+function assertV1Server(client: OpencodeSdkClient): Promise<void> {
+  let check = serverChecks.get(client);
+  if (!check) {
+    check = serverVersion(client).then((version) => {
+      if (majorVersion(version) >= 2) throw new Error(v2Message(version));
+      if (version) log.debug(`[opencode/sdk] server version ${version}`);
+    });
+    check.catch(() => serverChecks.delete(client));
+    serverChecks.set(client, check);
+  }
+  return check;
+}
+
+/** opencode `QuestionInfo[]` → the bridge's AskUserRequest. Every field is optional on the wire here. */
+/** Approval choices; the ids are opencode's own reply values (both reply routes take them). */
+const PERMISSION_OPTIONS: PermissionRequest['options'] = [
+  { id: 'once', name: '允许一次', kind: 'allow_once' },
+  { id: 'always', name: '本会话总是允许', kind: 'allow_always' },
+  { id: 'reject', name: '拒绝', kind: 'reject_once' },
+];
+
+/** ACP-style tool kind for an opencode permission name, when it maps onto one. */
+function permissionKind(permission?: string): string | undefined {
+  if (!permission) return undefined;
+  if (permission === 'bash') return 'execute';
+  if (/^(edit|write|patch|multiedit)$/.test(permission)) return 'edit';
+  if (/^(read|glob|grep|list)$/.test(permission)) return 'read';
+  if (/^(webfetch|websearch)$/.test(permission)) return 'fetch';
+  return undefined;
+}
+
+function toAskUserRequest(questions: unknown): AskUserRequest {
+  const list = Array.isArray(questions) ? questions as Array<Record<string, any>> : [];
+  return {
+    questions: list.map((item) => ({
+      question: String(item?.question || item?.header || ''),
+      options: (Array.isArray(item?.options) ? item.options : []).map((option: Record<string, any>) => ({
+        label: String(option?.label ?? ''),
+        ...(option?.description ? { description: String(option.description) } : {}),
+      })),
+      ...(item?.multiple ? { multiSelect: true } : {}),
+    })),
+  };
+}
+
 /** Resolves the SDK client. Injectable so the adapter can be driven by a fake in tests. */
 export type OpenCodeClientFactory = () => Promise<OpencodeSdkClient>;
 
@@ -184,6 +302,7 @@ export class OpenCodeAdapter implements CLIAdapter {
   readonly capabilities: AdapterCapabilities = {
     streaming: true, jsonOutput: true, sessionResume: true,
     modes: ['auto', 'safe', 'plan'], hasEffort: false, hasModel: true, hasSearch: false, hasBudget: false,
+    approvals: true,
   };
 
   // '' means "asked this server, it has no plan agent"; undefined means "not asked yet".
@@ -273,6 +392,7 @@ private resolveModelArg(model: string, workDir?: string): string {
     }
 
     const client = await this.clientFactory();
+    await assertV1Server(client);
     const directory = dirQuery(workDir);
     const dirOpt = directory ? { query: directory } : {};
 
@@ -315,9 +435,91 @@ private resolveModelArg(model: string, workDir?: string): string {
     let resultThinking = '';
     let resultError = false;
     let finished = false;
+    // Permission/question request ids already answered this turn. A 1.19 server may
+    // announce the same request under both the new and the legacy event name.
+    const answeredRequests = new Set<string>();
+    // The root session plus every subagent session spawned under it during this turn.
+    const turnSessions = new Set<string>([sessionId]);
 
     const msgMode = settings.msgMode || 'normal';
     const streamIntermediate = msgMode !== 'compact' && onIntermediate;
+
+    // 1.19 servers announce `permission.asked` and take `POST /permission/{id}/reply`;
+    // older ones announce `permission.updated` and only know the session-scoped route,
+    // which 1.19 still serves — so it doubles as the fallback.
+    const replyPermission = async (id: string, owner: string, modern: boolean, reply: 'once' | 'always' | 'reject') => {
+      if (modern) {
+        try {
+          await postJson(client, '/permission/{requestID}/reply', { path: { requestID: id }, body: { reply }, ...dirOpt });
+          return;
+        } catch (err) {
+          log.debug(`[opencode/sdk] /permission reply failed, trying legacy route: ${(err as Error).message}`);
+        }
+      }
+      await client.postSessionIdPermissionsPermissionId({
+        // The legacy route is scoped to the session that asked, which may be a child.
+        path: { id: owner, permissionID: id },
+        body: { response: reply },
+        ...dirOpt,
+        throwOnError: true,
+      });
+    };
+
+    // Safe mode with a bridge-side approval hook: the user picks once / always / reject.
+    // A throw, a null (e.g. the bridge timed out) or an unknown id all mean reject. The
+    // hook's signal fires when the turn ends or is cancelled.
+    const approvePermission = async (id: string, owner: string, modern: boolean, label: string, kind?: string) => {
+      let choice: string | null = null;
+      try {
+        choice = await opts.requestPermission!({ title: label, kind, options: PERMISSION_OPTIONS }, sseAbort.signal);
+      } catch (err) {
+        log.warn(`[opencode/sdk] permission not approved: ${(err as Error).message}`);
+      }
+      if (sseAbort.signal.aborted) return; // the turn already ended
+      const reply = choice === 'once' || choice === 'always' ? choice : 'reject';
+      try {
+        await replyPermission(id, owner, modern, reply);
+      } catch (err) {
+        log.warn(`[opencode/sdk] permission reply failed: ${(err as Error).message}`);
+      }
+      if (reply === 'reject' && streamIntermediate) {
+        onIntermediate!({ type: 'tool_result', content: `  ↳ 已拒绝权限请求（${label.substring(0, 100)}）` });
+      }
+    };
+
+    // The question tool blocks the session until it gets an answer. Without askUser (or
+    // when the user never replies) the question is rejected so the model carries on; if
+    // even that cannot be delivered the turn is aborted rather than left to time out.
+    const answerQuestion = async (id: string, questions: unknown) => {
+      const request = toAskUserRequest(questions);
+      let answers: string[][] | undefined;
+      if (opts.askUser && request.questions.length > 0) {
+        try {
+          const reply = await opts.askUser(request);
+          answers = request.questions.map((item) => (reply[item.question] ? [reply[item.question]] : []));
+        } catch (err) {
+          log.warn(`[opencode/sdk] question not answered: ${(err as Error).message}`);
+        }
+      }
+      if (sseAbort.signal.aborted) return; // the turn already ended
+      try {
+        if (answers) {
+          await postJson(client, '/question/{requestID}/reply', { path: { requestID: id }, body: { answers }, ...dirOpt });
+        } else {
+          await postJson(client, '/question/{requestID}/reject', { path: { requestID: id }, ...dirOpt });
+          if (streamIntermediate) {
+            onIntermediate!({ type: 'tool_result', content: '  ↳ 已跳过 OpenCode 的提问：未得到回答' });
+          }
+        }
+      } catch (err) {
+        if (sseAbort.signal.aborted) return;
+        log.warn(`[opencode/sdk] question reply failed: ${(err as Error).message}`);
+        resultError = true;
+        resultText += `\n[OpenCode 提问无法回复，已中止: ${(err as Error).message}]`;
+        finished = true;
+        void client.session.abort({ path: { id: sessionId }, ...dirOpt }).catch(() => { /* ignore */ });
+      }
+    };
 
     // Every execute() opened a fresh SSE subscription and never closed it: the loop only
     // returns when a *later* event arrives after `finished`, so a quiet stream stayed open
@@ -332,11 +534,23 @@ private resolveModelArg(model: string, workDir?: string): string {
           const properties = (ev as any)?.properties as Record<string, unknown> | undefined;
           if (!properties) continue;
 
-          // Only process events for our session
+          // Subagents (the task tool) run in child sessions whose permission and question
+          // requests block the parent just the same, so the turn's session tree is
+          // tracked from `parentID`. 1.19 stamps `session.created` with the child's own
+          // id, hence this runs before the per-session filter below.
+          if (type === 'session.created' || type === 'session.updated') {
+            const info = (properties as any).info as { id?: string; parentID?: string } | undefined;
+            if (info?.id && info.parentID && turnSessions.has(info.parentID)) turnSessions.add(info.id);
+            continue;
+          }
+
+          // Only process events for our session; permission/question requests from the
+          // turn's child sessions too. Text and tool streams stay root-only.
           const evSessionId = (properties as any).sessionID
             || (properties as any).info?.sessionID
             || (properties as any).part?.sessionID;
-          if (evSessionId && evSessionId !== sessionId) continue;
+          const isRequest = type === 'permission.asked' || type === 'permission.updated' || type === 'question.asked';
+          if (evSessionId && evSessionId !== sessionId && !(isRequest && turnSessions.has(evSessionId))) continue;
 
           switch (type) {
             case 'message.updated': {
@@ -413,27 +627,47 @@ private resolveModelArg(model: string, workDir?: string): string {
               break;
             }
 
-            // A headless bridge has nobody to answer a permission prompt. Left unanswered
-            // the session simply stops until the (now one hour) timeout fires, so every
-            // request is resolved here: approved under /mode auto, refused otherwise so
+            // Left unanswered a permission prompt stops the session until the (now one
+            // hour) timeout fires, so every request is resolved: approved under /mode auto,
+            // put to the user under /mode safe when the bridge can ask, refused otherwise so
             // the model gets a real denial and can carry on.
+            // `permission.asked` (1.19+) has no `title`: it names the permission and the
+            // patterns it covers instead; `permission.updated` is the pre-1.19 shape.
+            case 'permission.asked':
             case 'permission.updated': {
-              const permission = properties as unknown as { id?: string; sessionID?: string; title?: string };
-              if (!permission.id) break;
+              const permission = properties as {
+                id?: string; title?: string; permission?: string; type?: string; patterns?: unknown; pattern?: unknown;
+              };
+              if (!permission.id || answeredRequests.has(`permission:${permission.id}`)) break;
+              answeredRequests.add(`permission:${permission.id}`);
+              const owner = evSessionId || sessionId;
+              const modern = type === 'permission.asked';
+              const patterns = [permission.patterns, permission.pattern].flat().filter((p) => typeof p === 'string');
+              const label = permission.title
+                || [permission.permission || permission.type, patterns.join(' ')].filter(Boolean).join(' ')
+                || '未知操作';
+              if (settings.mode === 'safe' && opts.requestPermission) {
+                void approvePermission(permission.id, owner, modern, label, permissionKind(permission.permission || permission.type));
+                break;
+              }
               const response = settings.mode === 'auto' ? 'always' : 'reject';
-              void client.postSessionIdPermissionsPermissionId({
-                path: { id: sessionId, permissionID: permission.id },
-                body: { response },
-                ...dirOpt,
-              }).catch((err: unknown) => {
+              void replyPermission(permission.id, owner, modern, response).catch((err: unknown) => {
                 log.warn(`[opencode/sdk] permission reply failed: ${(err as Error).message}`);
               });
               if (response === 'reject' && streamIntermediate) {
                 onIntermediate!({
                   type: 'tool_result',
-                  content: `  ↳ 已拒绝权限请求（${permission.title || '未知操作'}）：非 auto 模式`,
+                  content: `  ↳ 已拒绝权限请求（${label.substring(0, 100)}）：非 auto 模式`,
                 });
               }
+              break;
+            }
+
+            case 'question.asked': {
+              const question = properties as { id?: string; questions?: unknown };
+              if (!question.id || answeredRequests.has(`question:${question.id}`)) break;
+              answeredRequests.add(`question:${question.id}`);
+              void answerQuestion(question.id, question.questions);
               break;
             }
 
@@ -478,8 +712,8 @@ private resolveModelArg(model: string, workDir?: string): string {
 
     // `permissionMode` was invented: no such field exists on the prompt body anywhere in
     // @opencode-ai/sdk, and the `as any` cast hid that from tsc, so /mode auto and /mode
-    // plan were silently dropped. Permissions are answered through `permission.updated`
-    // in the SSE loop above; plan mode is the server's own `plan` agent, used only when
+    // plan were silently dropped. Permissions are answered through `permission.asked` /
+    // `permission.updated` in the SSE loop above; plan mode is the server's own `plan` agent, used only when
     // this server actually publishes one.
     const agentName = settings.mode === 'plan'
       ? await this.resolvePlanAgent(client, directory)

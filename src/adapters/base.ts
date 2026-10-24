@@ -112,6 +112,8 @@ export interface ExecResult {
   thinking?: string;
   sessionId?: string;
   cost?: number;
+  /** Token usage reported by the CLI for this run, when it reports one. */
+  usage?: { inputTokens: number; outputTokens: number; cacheReadTokens?: number; cacheWriteTokens?: number };
   duration?: number;
   error?: boolean;
   /** Set by the adapter when the error is positively identified as a session/resume failure. */
@@ -133,6 +135,8 @@ export interface AdapterCapabilities {
   hasModel: boolean;
   hasSearch: boolean;
   hasBudget: boolean;
+  /** Calls `ExecOptions.requestPermission` in `safe` mode (approvals are asked in WeChat). */
+  approvals?: boolean;
 }
 
 export interface CLIAdapter {
@@ -205,23 +209,44 @@ function resolveWinDirectTarget(command: string): { file: string; prepend: strin
   return resolved;
 }
 
+/** Thrown by spawnCli({ strict: true }) on Windows when the command can't be spawned without
+ *  a shell — strict callers must never let cmd.exe interpret their argv. */
+export class ShellFallbackRefusedError extends Error {
+  constructor(readonly command: string) {
+    super(`'${command}' cannot be spawned without cmd.exe on Windows (no .exe / .js target found)`);
+    this.name = 'ShellFallbackRefusedError';
+  }
+}
+
+export interface SpawnCliOptions {
+  /** Never fall back to shell:true; throw ShellFallbackRefusedError instead. Use this when argv
+   *  carries untrusted text (e.g. a WeChat message), where cmd.exe parsing means injection. */
+  strict?: boolean;
+  /** Test seams: override the platform check and the Windows target resolution. */
+  win?: boolean;
+  resolveTarget?: (cmd: string) => { file: string; prepend: string[] } | null;
+}
+
 /** Spawn a CLI so that every argv element reaches the child verbatim on all platforms.
  *  POSIX: plain spawn (no shell). Windows: spawn past the `.cmd` shim (node.exe + entry, or the
  *  native .exe) so cmd.exe never re-parses the argv; only if that resolution fails do we fall
- *  back to the legacy shell:true path. Use this for any adapter that puts free-form user text
- *  on argv (e.g. Kimi's `-p <prompt>`); it also protects user-controlled flag VALUES
- *  (/system, /dir, /model) that would otherwise be mangled by cmd.exe. */
-export function spawnCli(cmd: string, args: string[], opts: import('node:child_process').SpawnOptions): ChildProcess {
-  if (!WIN) {
+ *  back to the legacy shell:true path (or throw, with `strict`). Use this for any adapter that
+ *  puts free-form user text on argv (e.g. Kimi's `-p <prompt>`); it also protects user-controlled
+ *  flag VALUES (/system, /dir, /model) that would otherwise be mangled by cmd.exe. */
+export function spawnCli(
+  cmd: string, args: string[], opts: import('node:child_process').SpawnOptions, cliOpts: SpawnCliOptions = {},
+): ChildProcess {
+  if (!(cliOpts.win ?? WIN)) {
     log.debug(`[spawn] ${cmd} ${args.map((a) => JSON.stringify(a)).join(' ')}`);
     return spawn(cmd, args, opts);
   }
-  const target = resolveWinDirectTarget(cmd);
+  const target = (cliOpts.resolveTarget ?? resolveWinDirectTarget)(cmd);
   if (target) {
     const full = [...target.prepend, ...args];
     log.debug(`[spawn] ${target.file} ${full.map((a) => JSON.stringify(a)).join(' ')}`);
     return spawn(target.file, full, { ...opts, shell: false, windowsVerbatimArguments: false });
   }
+  if (cliOpts.strict) throw new ShellFallbackRefusedError(cmd);
   log.warn(`[spawn] '${cmd}' not resolved past shell; argv with & | % " ^ may be mangled on Windows`);
   return spawnProc(cmd, args, opts);
 }

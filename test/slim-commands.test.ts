@@ -270,6 +270,40 @@ test('/resume for codex stores the real thread id, not the old last sentinel', a
   assert.equal(settings.sessionIds.codex, '01a16c26-ec92-7150-9dcc-bbd651c1270f');
 });
 
+test('/resume <编号> only picks from the list this user last got for this tool and directory', async () => {
+  const { router, slash, last, settings } = createRouter('codex');
+  const sessions: Record<string, Array<{ id: string; date: string; summary: string }>> = {
+    codex: [{ id: 'codex-thread-1', date: 'd', summary: 'codex one' }],
+    claude: [{ id: 'claude-sess-1', date: 'd', summary: 'claude one' }, { id: 'claude-sess-2', date: 'd', summary: 'claude two' }],
+  };
+  router.listSessions = (tool: string) => sessions[tool] ?? [];
+
+  await slash('/resume');
+  // Another user never picks from u1's list.
+  await router.handleSlash('u2', '/resume 1');
+  assert.equal(last(), '没有可选的 codex 会话列表，先发 /resume 查看');
+  assert.equal(settings.sessionIds.codex, undefined);
+
+  // Another tool never picks a codex id from the codex list.
+  settings.defaultTool = 'claude';
+  await slash('/resume 1');
+  assert.equal(last(), '没有可选的 claude 会话列表，先发 /resume 查看');
+  assert.equal(settings.sessionIds.claude, undefined);
+  await slash('/resume');
+  await slash('/resume 2');
+  assert.equal(settings.sessionIds.claude, 'claude-sess-2');
+
+  // Back on codex, u1's codex list is still there.
+  settings.defaultTool = 'codex';
+  await slash('/resume 1');
+  assert.equal(settings.sessionIds.codex, 'codex-thread-1');
+
+  // A list taken in another directory is stale.
+  settings.workDir = mkdtempSync(join(tmpdir(), 'other-dir-'));
+  await slash('/resume 1');
+  assert.equal(last(), '没有可选的 codex 会话列表，先发 /resume 查看');
+});
+
 test('a stored legacy sentinel gets a one-time 已开新会话 notice once the adapter returns a real id', async () => {
   const { router, messages, executes, settings } = createRouter('codex');
   settings.sessionIds.codex = 'last';
