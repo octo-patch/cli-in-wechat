@@ -799,7 +799,9 @@ test('a corrupt task ledger is moved aside instead of being silently discarded',
   assert.deepEqual(new InboundTaskStore(path).list(), []);
 });
 
-test('a corrupt ledger that cannot be moved aside still lets the bridge start', () => {
+// Relies on a read-only directory blocking rename/copy, which Windows ACLs and root ignore.
+const cannotBlockWrites = process.platform === 'win32' || process.getuid?.() === 0;
+test('a corrupt ledger that cannot be moved aside still lets the bridge start', { skip: cannotBlockWrites }, () => {
   const dir = freshDir();
   const path = join(dir, 'inbound-tasks.json');
   writeFileSync(path, JSON.stringify({ schemaVersion: 99, tasks: [] }));
