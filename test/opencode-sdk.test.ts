@@ -424,6 +424,87 @@ test('non-auto mode rejects permission.asked and describes it without a title', 
   assert.ok(notice.content.includes('bash rm -rf build'));
 });
 
+test('safe mode puts permission requests to requestPermission: once, always, reject (both routes, subagents)', async () => {
+  const fake = createFakeClient({
+    events: [
+      childCreated('ses_child', 'ses_active'),
+      permissionAsked('per_once', { patterns: ['npm test'] }),
+      permissionAsked('per_always', { permission: 'edit', patterns: ['src/a.ts'] }),
+      permissionAsked('per_reject', { patterns: ['rm -rf /'] }),
+      { type: 'permission.updated', properties: { id: 'per_legacy', sessionID: 'ses_child', title: 'webfetch example.com' } },
+      IDLE,
+    ],
+  });
+  const answers: Record<string, string> = {
+    'bash npm test': 'once', 'edit src/a.ts': 'always', 'bash rm -rf /': 'reject', 'webfetch example.com': 'always',
+  };
+  const asked: any[] = [];
+  const signals: unknown[] = [];
+  const activity: IntermediateMessage[] = [];
+
+  await new OpenCodeAdapter(fake.factory).execute('hi', {
+    settings: settings({ mode: 'safe', sessionIds: { opencode: 'ses_active' } }),
+    requestPermission: async (req, signal) => { asked.push(req); signals.push(signal); return answers[req.title]; },
+    onIntermediate: (msg) => activity.push(msg),
+  });
+
+  assert.equal(asked.length, 4);
+  assert.deepEqual(asked[0], {
+    title: 'bash npm test',
+    kind: 'execute',
+    options: [
+      { id: 'once', name: '允许一次', kind: 'allow_once' },
+      { id: 'always', name: '本会话总是允许', kind: 'allow_always' },
+      { id: 'reject', name: '拒绝', kind: 'reject_once' },
+    ],
+  });
+  assert.equal(asked[1].kind, 'edit');
+  assert.ok(signals.every((signal) => signal instanceof AbortSignal));
+  const modern = Object.fromEntries(fake.all('POST /permission/{requestID}/reply').map((r) => [r.path.requestID, r.body.reply]));
+  assert.deepEqual(modern, { per_once: 'once', per_always: 'always', per_reject: 'reject' });
+  const legacy = fake.find('permission.respond');
+  assert.deepEqual(legacy.path, { id: 'ses_child', permissionID: 'per_legacy' });
+  assert.equal(legacy.body.response, 'always');
+  const notices = activity.filter((msg) => msg.content.includes('已拒绝权限请求'));
+  assert.deepEqual(notices.map((msg) => msg.content), ['  ↳ 已拒绝权限请求（bash rm -rf /）']);
+});
+
+test('a throwing, timed-out, null or unknown approval is a rejection', async () => {
+  const fake = createFakeClient({
+    events: [permissionAsked('per_throw'), permissionAsked('per_timeout'), permissionAsked('per_null'), permissionAsked('per_odd'), IDLE],
+  });
+  const answers = [
+    () => Promise.reject(new Error('boom')),
+    () => Promise.reject(new DOMException('approval timed out', 'TimeoutError')),
+    () => Promise.resolve(null),
+    () => Promise.resolve('allow_please'),
+  ];
+  let n = 0;
+
+  await new OpenCodeAdapter(fake.factory).execute('hi', {
+    settings: settings({ mode: 'safe', sessionIds: { opencode: 'ses_active' } }),
+    requestPermission: () => answers[n++](),
+  });
+
+  assert.equal(n, 4);
+  const replies = fake.all('POST /permission/{requestID}/reply');
+  assert.equal(replies.length, 4);
+  assert.ok(replies.every((r) => r.body.reply === 'reject'));
+});
+
+test('auto and plan never call requestPermission', async () => {
+  for (const [mode, reply] of [['auto', 'always'], ['plan', 'reject']] as const) {
+    const fake = createFakeClient({ events: [permissionAsked('per_1'), IDLE] });
+    let called = false;
+    await new OpenCodeAdapter(fake.factory).execute('hi', {
+      settings: settings({ mode, sessionIds: { opencode: 'ses_active' } }),
+      requestPermission: async () => { called = true; return 'once'; },
+    });
+    assert.equal(called, false, mode);
+    assert.deepEqual(fake.find('POST /permission/{requestID}/reply').body, { reply }, mode);
+  }
+});
+
 test('question.asked is relayed to askUser and the answer sent back', async () => {
   const fake = createFakeClient({ events: [questionAsked('que_1'), IDLE] });
   const asked: any[] = [];

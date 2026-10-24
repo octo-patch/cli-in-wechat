@@ -1,6 +1,6 @@
 import { log } from '../utils/logger.js';
 import { DEFAULT_CLI_TIMEOUT } from '../config.js';
-import type { CLIAdapter, ExecOptions, ExecResult, AdapterCapabilities, IntermediateMessage, AskUserRequest } from './base.js';
+import type { CLIAdapter, ExecOptions, ExecResult, AdapterCapabilities, IntermediateMessage, AskUserRequest, PermissionRequest } from './base.js';
 import { commandExists, spawnProc, setupAbort, setupTimeout, stripAnsi, summarizeToolUse, summarizeToolResult } from './base.js';
 import type { DownloadedMedia } from '../utils/media.js';
 import { copyMediaToWorkDir } from '../utils/media.js';
@@ -261,6 +261,23 @@ function assertV1Server(client: OpencodeSdkClient): Promise<void> {
 }
 
 /** opencode `QuestionInfo[]` → the bridge's AskUserRequest. Every field is optional on the wire here. */
+/** Approval choices; the ids are opencode's own reply values (both reply routes take them). */
+const PERMISSION_OPTIONS: PermissionRequest['options'] = [
+  { id: 'once', name: '允许一次', kind: 'allow_once' },
+  { id: 'always', name: '本会话总是允许', kind: 'allow_always' },
+  { id: 'reject', name: '拒绝', kind: 'reject_once' },
+];
+
+/** ACP-style tool kind for an opencode permission name, when it maps onto one. */
+function permissionKind(permission?: string): string | undefined {
+  if (!permission) return undefined;
+  if (permission === 'bash') return 'execute';
+  if (/^(edit|write|patch|multiedit)$/.test(permission)) return 'edit';
+  if (/^(read|glob|grep|list)$/.test(permission)) return 'read';
+  if (/^(webfetch|websearch)$/.test(permission)) return 'fetch';
+  return undefined;
+}
+
 function toAskUserRequest(questions: unknown): AskUserRequest {
   const list = Array.isArray(questions) ? questions as Array<Record<string, any>> : [];
   return {
@@ -429,7 +446,7 @@ private resolveModelArg(model: string, workDir?: string): string {
     // 1.19 servers announce `permission.asked` and take `POST /permission/{id}/reply`;
     // older ones announce `permission.updated` and only know the session-scoped route,
     // which 1.19 still serves — so it doubles as the fallback.
-    const replyPermission = async (id: string, owner: string, modern: boolean, reply: 'always' | 'reject') => {
+    const replyPermission = async (id: string, owner: string, modern: boolean, reply: 'once' | 'always' | 'reject') => {
       if (modern) {
         try {
           await postJson(client, '/permission/{requestID}/reply', { path: { requestID: id }, body: { reply }, ...dirOpt });
@@ -445,6 +462,28 @@ private resolveModelArg(model: string, workDir?: string): string {
         ...dirOpt,
         throwOnError: true,
       });
+    };
+
+    // Safe mode with a bridge-side approval hook: the user picks once / always / reject.
+    // A throw, a null (e.g. the bridge timed out) or an unknown id all mean reject. The
+    // hook's signal fires when the turn ends or is cancelled.
+    const approvePermission = async (id: string, owner: string, modern: boolean, label: string, kind?: string) => {
+      let choice: string | null = null;
+      try {
+        choice = await opts.requestPermission!({ title: label, kind, options: PERMISSION_OPTIONS }, sseAbort.signal);
+      } catch (err) {
+        log.warn(`[opencode/sdk] permission not approved: ${(err as Error).message}`);
+      }
+      if (sseAbort.signal.aborted) return; // the turn already ended
+      const reply = choice === 'once' || choice === 'always' ? choice : 'reject';
+      try {
+        await replyPermission(id, owner, modern, reply);
+      } catch (err) {
+        log.warn(`[opencode/sdk] permission reply failed: ${(err as Error).message}`);
+      }
+      if (reply === 'reject' && streamIntermediate) {
+        onIntermediate!({ type: 'tool_result', content: `  ↳ 已拒绝权限请求（${label.substring(0, 100)}）` });
+      }
     };
 
     // The question tool blocks the session until it gets an answer. Without askUser (or
@@ -587,9 +626,9 @@ private resolveModelArg(model: string, workDir?: string): string {
               break;
             }
 
-            // A headless bridge has nobody to answer a permission prompt. Left unanswered
-            // the session simply stops until the (now one hour) timeout fires, so every
-            // request is resolved here: approved under /mode auto, refused otherwise so
+            // Left unanswered a permission prompt stops the session until the (now one
+            // hour) timeout fires, so every request is resolved: approved under /mode auto,
+            // put to the user under /mode safe when the bridge can ask, refused otherwise so
             // the model gets a real denial and can carry on.
             // `permission.asked` (1.19+) has no `title`: it names the permission and the
             // patterns it covers instead; `permission.updated` is the pre-1.19 shape.
@@ -600,15 +639,21 @@ private resolveModelArg(model: string, workDir?: string): string {
               };
               if (!permission.id || answeredRequests.has(`permission:${permission.id}`)) break;
               answeredRequests.add(`permission:${permission.id}`);
+              const owner = evSessionId || sessionId;
+              const modern = type === 'permission.asked';
+              const patterns = [permission.patterns, permission.pattern].flat().filter((p) => typeof p === 'string');
+              const label = permission.title
+                || [permission.permission || permission.type, patterns.join(' ')].filter(Boolean).join(' ')
+                || '未知操作';
+              if (settings.mode === 'safe' && opts.requestPermission) {
+                void approvePermission(permission.id, owner, modern, label, permissionKind(permission.permission || permission.type));
+                break;
+              }
               const response = settings.mode === 'auto' ? 'always' : 'reject';
-              void replyPermission(permission.id, evSessionId || sessionId, type === 'permission.asked', response).catch((err: unknown) => {
+              void replyPermission(permission.id, owner, modern, response).catch((err: unknown) => {
                 log.warn(`[opencode/sdk] permission reply failed: ${(err as Error).message}`);
               });
               if (response === 'reject' && streamIntermediate) {
-                const patterns = [permission.patterns, permission.pattern].flat().filter((p) => typeof p === 'string');
-                const label = permission.title
-                  || [permission.permission || permission.type, patterns.join(' ')].filter(Boolean).join(' ')
-                  || '未知操作';
                 onIntermediate!({
                   type: 'tool_result',
                   content: `  ↳ 已拒绝权限请求（${label.substring(0, 100)}）：非 auto 模式`,
