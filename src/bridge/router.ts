@@ -47,6 +47,14 @@ type InteractionEnd = 'timeout' | 'cancelled' | 'invalid' | 'stopped' | 'unsent'
  * restart there is nobody left to deliver an answer to (see `staleAnswerHint`).
  */
 interface PendingInteraction {
+  /** Tool whose run is waiting: an @mention of any other tool is never taken as the answer. */
+  toolName: string;
+  /** What the user is expected to send, for the "message not executed" notice. */
+  waitingHint: string;
+  /** Approvals only accept a listed choice; AskUser questions take any text. */
+  freeText: boolean;
+  /** The prompt actually reached WeChat (not merely queued in the outbox). */
+  delivered: boolean;
   text: string;
   /** Sent once after an invalid reply; absent when every reply is a valid answer. */
   retryText?: string;
@@ -902,7 +910,7 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
       const prompt = chainMatch[3].trim();
       if (t1 && t2 && this.registry.isAvailable(t1) && this.registry.isAvailable(t2)) {
         const busy = [t1, t2].find(t => this.active.has(`${uid}:${t}`));
-        if (busy) { await this.ilink.sendText(uid, `${busy} 在忙`); return; }
+        if (busy) { await this.ilink.sendText(uid, this.busyText(uid, busy)); return; }
         await this.chain(uid, t1, t2, prompt + mediaContext, media, taskGeneration, run);
         return;
       }
@@ -920,7 +928,7 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
       const prompt = atRelayMatch ? atRelayMatch[2].trim() : rest;
       const toolName = this.getCli(uid, rest, refText);
       this.sessions.update(uid, { defaultTool: toolName });
-      if (this.active.has(`${uid}:${toolName}`)) { await this.ilink.sendText(uid, `${toolName} 在忙`); return; }
+      if (this.active.has(`${uid}:${toolName}`)) { await this.ilink.sendText(uid, this.busyText(uid, toolName)); return; }
       const fullPrompt = `以下是 ${prev.tool} 的输出:\n\n${prev.text}\n\n---\n\n${prompt}${mediaContext}`;
       await this.exec(uid, toolName, fullPrompt, media, taskGeneration, run);
       return;
@@ -955,7 +963,7 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
       return;
     }
 
-    if (this.active.has(`${uid}:${toolName}`)) { await this.ilink.sendText(uid, `${toolName} 在忙`); return; }
+    if (this.active.has(`${uid}:${toolName}`)) { await this.ilink.sendText(uid, this.busyText(uid, toolName)); return; }
 
     const prompt = atMatch ? atMatch[2].trim() : trimmed;
     const combined = [prompt, refText].filter(Boolean).join('\n\n') + mediaContext;
@@ -1605,6 +1613,8 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
       case 'resume': case 'sessions': {
         const tool = settings.defaultTool || this.config.defaultTool;
         if (arg) {
+          // Another session: its "本会话自动允许" grants don't carry over.
+          this.clearSessionGrants(uid);
           // /resume <number> → pick from list, or /resume <uuid> → direct set
           const num = parseInt(arg);
           if (!isNaN(num) && this._lastSessionList) {
@@ -1949,6 +1959,9 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
    * undeliverable prompt or a second invalid reply. While it waits the task stays `running`.
    */
   private interact<T>(uid: string, spec: {
+    toolName: string;
+    waitingHint: string;
+    freeText: boolean;
     text: string;
     retryText?: string;
     parse: (reply: string) => T | undefined;
@@ -1966,6 +1979,10 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
         this.dropInteraction(uid, item);
       };
       const item: PendingInteraction = {
+        toolName: spec.toolName,
+        waitingHint: spec.waitingHint,
+        freeText: spec.freeText,
+        delivered: false,
         text: spec.text,
         retryText: spec.retryText,
         retried: false,
@@ -2041,6 +2058,7 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
       item.expire('unsent');
       return;
     }
+    item.delivered = true;
     item.timer = setTimeout(() => item.expire('timeout'), INTERACTION_TIMEOUT_MS);
   }
 
@@ -2053,11 +2071,29 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
     else if (index === 0 && !this.stopping) this.showInteraction(uid, queue[0]);
   }
 
-  /** Route a reply to the head interaction. True when the reply was consumed. */
-  private async answerInteraction(uid: string, reply: string): Promise<boolean> {
+  /**
+   * Route a message to the head interaction when it is an answer to it. True when consumed.
+   * Everything else goes through normal routing, so no message is swallowed:
+   * - nothing is an answer before the prompt actually reached WeChat (the user hasn't seen it);
+   * - `@<another tool> …` is addressed to that tool; `@<asking tool> 2` answers with "2";
+   * - an approval only takes its listed choices — a wrong number gets one re-prompt, then the
+   *   request is rejected; ordinary text is not an answer (if it targets the waiting tool, the
+   *   busy notice says the tool is waiting and the message was not executed);
+   * - an AskUser question takes any text, as free-form answers are allowed.
+   */
+  private async answerInteraction(uid: string, text: string): Promise<boolean> {
     const head = this.interactions.get(uid)?.[0];
-    if (!head) return false;
+    if (!head?.delivered) return false;
+    let reply = text;
+    const at = text.match(/^@(\w+)(?:[\s：:]+([\s\S]*))?$/);
+    const mentioned = at ? this.mentionedTool(at[1]) : undefined;
+    if (mentioned) {
+      if (mentioned !== head.toolName) return false;
+      reply = (at![2] || '').trim();
+      if (!reply) return false;
+    }
     if (head.answer(reply)) return true;
+    if (head.freeText || !BARE_ANSWER.test(reply)) return false;
     if (head.retryText && !head.retried) {
       head.retried = true;
       await this.ilink.sendText(uid, head.retryText, { priority: 'control' });
@@ -2065,6 +2101,22 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
       head.expire('invalid');
     }
     return true;
+  }
+
+  /** Registry name behind an @mention, or undefined when it names no tool. */
+  private mentionedTool(name: string): string | undefined {
+    return TOOL_ALIASES[name.toLowerCase()];
+  }
+
+  /** The "<tool> 在忙" reply, saying so explicitly when the tool is waiting on the user. */
+  private busyText(uid: string, toolName: string): string {
+    const waiting = this.interactions.get(uid)?.find((item) => item.toolName === toolName);
+    const displayName = this.registry.get(toolName)?.displayName ?? toolName;
+    if (!waiting) return `${toolName} 在忙`;
+    if (!waiting.delivered) {
+      return `${displayName} 有一条提问/审批还没送达微信（回复「继续」接收）。\n这条消息未执行，处理完后请重发。`;
+    }
+    return `${displayName} 正在等你${waiting.waitingHint}。\n这条消息未执行，处理完后请重发。`;
   }
 
   /**
@@ -2112,6 +2164,9 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
 
     // Free-form answers are valid, so there is no retry; timeout / cancel throw (the adapter denies).
     const reply = await this.interact<string>(uid, {
+      toolName,
+      waitingHint: '回答提问（直接回复即可）',
+      freeText: true,
       text: lines.join('\n'),
       parse: (text) => text,
       onExpire: (why) => new Error(why === 'timeout' ? '回复超时' : why === 'cancelled' ? '已取消' : '未回复'),
@@ -2160,7 +2215,7 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
     const byKind = (kind: string) => req.options.find((option) => option.kind === kind);
     const allow = (byKind('allow_once') ?? byKind('allow_always'))?.id;
     const grantKey = `${uid}:${toolName}`;
-    const rule = permissionRuleKey(req);
+    const { key: rule, label } = permissionRule(req);
     const title = req.title.length > 300 ? `${req.title.slice(0, 300)}…` : req.title;
     const granted = (): string | undefined => {
       if (!allow || !this.sessionGrants.get(grantKey)?.has(rule)) return undefined;
@@ -2174,10 +2229,13 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
     const lines: string[] = [];
     const once = byKind('allow_once');
     if (once) { choices.set('1', once.id); lines.push('1. 允许一次'); }
-    if (allow) { choices.set('2', allow); lines.push(`2. 本会话总是允许此类操作（${rule}）`); }
+    if (allow) { choices.set('2', allow); lines.push(`2. 本会话自动允许所有「${label}」`); }
     choices.set('3', (byKind('reject_once') ?? byKind('reject_always'))?.id ?? null);
     lines.push('3. 拒绝');
     return this.interact<string | null>(uid, {
+      toolName,
+      waitingHint: `审批（回复 ${[...choices.keys()].join('/')}）`,
+      freeText: false,
       text: `${displayName} 请求权限：${title}\n${lines.join('\n')}\n— 回复数字；5 分钟无回复自动拒绝`,
       retryText: `请回复 ${[...choices.keys()].join('/')}（${displayName} 请求权限：${title}）\n再次无效将自动拒绝`,
       // A grant made while this request sat in the queue answers it without a message.
@@ -2206,21 +2264,21 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
   }
 
   /**
-   * Streaming yields to approval prompts: nothing streams while a prompt waits for the user, and in
-   * `safe` mode (the only one that asks) the last free item of a delivery window is kept for a
-   * prompt instead of being spent on progress text. Held-back text is not lost: the final answer
+   * Streaming yields to approval prompts: nothing streams while a prompt waits for the user, and
+   * for a tool that asks in WeChat (`capabilities.approvals`) in `safe` mode the last free item
+   * of a delivery window is kept for a prompt instead of being spent on progress text. Held-back text is not lost: the final answer
    * is then sent in full rather than as a footer. Router-side only; the outbox and quota rules
    * (src/ilink) and the durable task lifecycle are untouched.
    */
-  private holdStreamForPrompt(uid: string, mode?: string): boolean {
+  private holdStreamForPrompt(uid: string, mode: string | undefined, asksApprovals: boolean): boolean {
     if (this.interactions.has(uid)) return true;
-    if (mode !== 'safe') return false;
+    if (mode !== 'safe' || !asksApprovals) return false;
     const status = this.deliveryStatus(uid) as (DeliveryStatusView & { quota: { remainingItems?: number } }) | undefined;
     const remaining = status?.quota.remainingItems;
     return typeof remaining === 'number' && remaining - status!.pending.length <= 1;
   }
 
-  /** "本会话" ends with /new, /clear, a workDir change or a restart (grants are memory-only). */
+  /** "本会话" ends with /new, /clear, /resume <…>, a workDir change or a restart (grants are memory-only). */
   private clearSessionGrants(uid: string): void {
     for (const key of [...this.sessionGrants.keys()]) {
       if (key.startsWith(`${uid}:`)) this.sessionGrants.delete(key);
@@ -2261,7 +2319,7 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
       if (!text.trim()) return;
       sendQueue = sendQueue
         .then(() => {
-          if (this.holdStreamForPrompt(uid, settings.mode)) {
+          if (this.holdStreamForPrompt(uid, settings.mode, Boolean(adapter.capabilities.approvals))) {
             if (priority === 'intermediate') streamHeldBack = true;
             return;
           }
@@ -2427,12 +2485,23 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
   }
 }
 
-/** Grant granularity: the agent's tool kind (execute / edit / fetch …), else the tool name that
- *  leads the title ("Bash: npm test" → "Bash"), else the whole title. */
-function permissionRuleKey(req: PermissionRequest): string {
-  if (req.kind) return req.kind;
-  const head = req.title.split(':')[0].trim();
-  return head || req.title.trim() || 'tool';
+/**
+ * Scope of a "2 = 本会话自动允许" grant. Commands are granted per program (the first word of the
+ * command: allowing `npm test` also allows `npm run build`, never `rm -rf`). Other calls are
+ * granted per tool kind (edit / read / fetch …), else per the tool name leading the title
+ * ("Skill: x" → "Skill"). The prompt spells the scope out.
+ */
+function permissionRule(req: PermissionRequest): { key: string; label: string } {
+  if (req.kind === 'execute') {
+    const quoted = /`([^`]+)`/.exec(req.title)?.[1];
+    const command = (quoted ?? req.title.replace(/^[^:：`]*[:：]\s*/, ''))
+      .trim().replace(/^(run|execute|运行|执行)\s+/i, '');
+    const program = command.split(/\s+/)[0];
+    if (program) return { key: `execute:${program}`, label: `${program} 命令` };
+  }
+  if (req.kind) return { key: req.kind, label: `${req.kind} 类操作` };
+  const head = req.title.split(/[:：]/)[0].trim() || req.title.trim() || 'tool';
+  return { key: head, label: `${head} 操作` };
 }
 
 function errorMessage(err: unknown): string {

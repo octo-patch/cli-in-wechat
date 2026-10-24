@@ -6,6 +6,57 @@ import { GeminiAdapter } from './gemini.js';
 import { KimiAdapter } from './kimi.js';
 import { OpenCodeAdapter } from './opencode-sdk.js';
 import { OpenCodeAdapter as OpenCodeCliAdapter } from './opencode.js';
+import { AcpAdapter, type AcpPreset } from './acp/adapter.js';
+import { ACP_PRESETS } from './acp/presets.js';
+import { TextAdapter } from './text.js';
+import type { AgentConfig } from '../config.js';
+
+const NATIVE_NAMES = new Set(['claude', 'codex', 'gemini', 'kimi', 'opencode', 'opencode-cli']);
+const isStrArray = (v: unknown): v is string[] => Array.isArray(v) && v.every((x) => typeof x === 'string');
+const isStrRecord = (v: unknown): v is Record<string, string> =>
+  !!v && typeof v === 'object' && !Array.isArray(v) && Object.values(v).every((x) => typeof x === 'string');
+
+/**
+ * Merge config.json `agents` over the built-in ACP presets and build one adapter per entry.
+ * Same name → the given fields replace the preset's (protocol defaults to 'acp'); `disabled`
+ * drops it; a new name is added. Bad entries are warned about and skipped, never fatal.
+ */
+export function resolveAgentAdapters(agents: unknown, presets: AcpPreset[] = ACP_PRESETS): CLIAdapter[] {
+  const merged = new Map<string, AgentConfig>(presets.map((p) => [p.name, { ...p, protocol: 'acp' as const }]));
+  for (const raw of Array.isArray(agents) ? agents : []) {
+    const a = (raw && typeof raw === 'object' ? raw : {}) as Partial<AgentConfig>;
+    const label = typeof a.name === 'string' ? a.name : JSON.stringify(raw);
+    const bad = (why: string) => log.warn(`[config] agents 条目 ${label} 无效（${why}），已跳过`);
+    if (typeof a.name !== 'string' || !/^[a-z0-9-]+$/.test(a.name)) { bad('name 须为 [a-z0-9-]+'); continue; }
+    if (NATIVE_NAMES.has(a.name)) { bad('与内置工具重名'); continue; }
+    const base = merged.get(a.name);
+    if (a.disabled === true) { merged.delete(a.name); continue; }
+    let inherited = base;
+    if (base && a.protocol && a.protocol !== base.protocol) {
+      // A preset's args/modeIds belong to its old protocol; don't carry them over silently.
+      const { args: _args, modeIds: _modeIds, ...rest } = base;
+      inherited = rest;
+      if ((a.args === undefined && base.args?.length) || (a.protocol === 'acp' && base.modeIds && a.modeIds === undefined)) {
+        log.warn(`[config] agents 条目 ${a.name} 把 protocol 从 ${base.protocol} 改为 ${a.protocol}，未继承预设的 args/modeIds`);
+      }
+    }
+    const next: AgentConfig = { ...inherited, ...a } as AgentConfig;
+    next.protocol ??= 'acp';
+    if (next.protocol !== 'acp' && next.protocol !== 'text') { bad('protocol 须为 acp 或 text'); continue; }
+    if (typeof next.command !== 'string' || !next.command.trim()) { bad('command 不能为空'); continue; }
+    if (next.args !== undefined && !isStrArray(next.args)) { bad('args 须为字符串数组'); continue; }
+    if (next.env !== undefined && !isStrRecord(next.env)) { bad('env 须为字符串字典'); continue; }
+    if (next.modeIds !== undefined && !isStrRecord(next.modeIds)) { bad('modeIds 须为字符串字典'); continue; }
+    if (next.promptVia !== undefined && next.promptVia !== 'stdin' && next.promptVia !== 'arg') { bad('promptVia 须为 stdin 或 arg'); continue; }
+    merged.set(a.name, next);
+  }
+  return Array.from(merged.values(), (a) => {
+    const common = { name: a.name, displayName: a.displayName || a.name, command: a.command!, args: a.args ?? [], env: a.env };
+    return a.protocol === 'text'
+      ? new TextAdapter({ ...common, promptVia: a.promptVia ?? 'stdin' })
+      : new AcpAdapter({ ...common, modeIds: a.modeIds });
+  });
+}
 
 export class AdapterRegistry {
   private adapters = new Map<string, CLIAdapter>();
@@ -14,7 +65,7 @@ export class AdapterRegistry {
   // Fallback chains: primary name → [fallback names]
   private fallbackChains = new Map<string, string[]>();
 
-  constructor() {
+  constructor(agents?: AgentConfig[]) {
     this.register(new ClaudeAdapter());
     this.register(new CodexAdapter());
     this.register(new GeminiAdapter());
@@ -23,6 +74,9 @@ export class AdapterRegistry {
     this.register(new OpenCodeAdapter());
     this.register(new OpenCodeCliAdapter(), 'opencode-cli');
     this.fallbackChains.set('opencode', ['opencode-cli']);
+    // Generic ACP agents (Qwen Code, Copilot, Cursor, CodeBuddy, Droid, Devin, Qoder, MiniMax)
+    // plus any user-defined `agents` from config.json.
+    for (const adapter of resolveAgentAdapters(agents)) this.register(adapter);
   }
 
   private register(adapter: CLIAdapter, fallbackName?: string): void {
