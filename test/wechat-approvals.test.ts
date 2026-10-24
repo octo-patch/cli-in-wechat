@@ -69,7 +69,7 @@ function createRouter(adapters: Record<string, Execute>) {
     get: (name: string) => (adapters[name] ? {
       name,
       displayName: displayName(name),
-      capabilities: { sessionResume: false },
+      capabilities: { sessionResume: false, approvals: name !== 'gemini' }, // gemini: a tool that never asks in WeChat
       execute: (prompt: string, opts: any) => { calls.push(`${name}:${prompt.split('\n')[0]}`); return adapters[name](prompt, opts); },
     } : undefined),
   };
@@ -119,7 +119,7 @@ for (const [reply, expected] of [['1', 'opt-once'], ['2', 'opt-once'], ['3', 'op
     const run = router.exec('u1', 'claude', 'do it');
     await waitFor(() => approvals().length === 1, 'approval prompt');
     const prompt = approvals()[0];
-    assert.equal(prompt.text, 'Claude 请求权限：Run `npm test`\n1. 允许一次\n2. 本会话总是允许此类操作（execute）\n3. 拒绝\n— 回复数字；5 分钟无回复自动拒绝');
+    assert.equal(prompt.text, 'Claude 请求权限：Run `npm test`\n1. 允许一次\n2. 本会话自动允许所有「npm 命令」\n3. 拒绝\n— 回复数字；5 分钟无回复自动拒绝');
     assert.equal(prompt.options?.priority, 'control');
 
     await send(reply);
@@ -143,7 +143,7 @@ test('choices follow the offered options: no allow_once hides 1, no allow option
 
   const run = router.exec('u1', 'claude', 'do it');
   await waitFor(() => approvals().length === 1);
-  assert.match(approvals()[0].text, /请求权限：Edit a\.ts\n2\. 本会话总是允许此类操作（edit）\n3\. 拒绝\n/);
+  assert.match(approvals()[0].text, /请求权限：Edit a\.ts\n2\. 本会话自动允许所有「edit 类操作」\n3\. 拒绝\n/);
   await reply('1');
   assert.match(messages.at(-1)!.text, /^请回复 2\/3（Claude 请求权限：Edit a\.ts）\n再次无效将自动拒绝$/);
   assert.equal(messages.at(-1)!.options?.priority, 'control');
@@ -156,50 +156,78 @@ test('choices follow the offered options: no allow_once hides 1, no allow option
   assert.deepEqual(results, ['opt-always', 'opt-reject']);
 });
 
-test('choosing 2 auto-approves later requests of the same kind for that tool until /new', async () => {
+test('choosing 2 auto-approves the same program for that tool until /new or /resume', async () => {
   const results: Array<string | null> = [];
-  const requests: PermissionRequest[] = [{ title: 'Bash: npm test', options: FULL_OPTIONS }];
+  const bash = (command: string): PermissionRequest => ({ title: `Shell Command: \`${command}\``, kind: 'execute', options: FULL_OPTIONS });
+  const requests: PermissionRequest[] = [bash('npm test')];
   const { router, approvals, reply } = createRouter({
     claude: async (_prompt, opts) => {
       for (const req of requests) results.push(await opts.requestPermission(req));
       return { text: 'ok' };
     },
     codex: async (_prompt, opts) => {
-      results.push(await opts.requestPermission({ title: 'Bash: ls', options: FULL_OPTIONS }));
+      results.push(await opts.requestPermission(bash('npm ls')));
       return { text: 'ok' };
     },
   });
 
   let run = router.exec('u1', 'claude', 'first');
   await waitFor(() => approvals().length === 1);
-  assert.match(approvals()[0].text, /2\. 本会话总是允许此类操作（Bash）/);
+  assert.match(approvals()[0].text, /2\. 本会话自动允许所有「npm 命令」/);
   await reply('2');
   await run;
 
-  // Same tool + same rule key ("Bash" from the title) → answered without a WeChat message.
-  requests.splice(0, 1, { title: 'Bash: rm -rf dist', options: FULL_OPTIONS }, { title: 'Write: a.ts', options: FULL_OPTIONS });
+  // Same tool + same program → answered without a WeChat message; another program still asks.
+  requests.splice(0, 1, bash('npm run build'), bash('rm -rf dist'), { title: 'Write: a.ts', kind: 'edit', options: FULL_OPTIONS });
   run = router.exec('u1', 'claude', 'second');
   await waitFor(() => approvals().length === 2);
-  assert.match(approvals()[1].text, /请求权限：Write: a\.ts/);
+  assert.match(approvals()[1].text, /请求权限：Shell Command: `rm -rf dist`/);
+  await reply('3');
+  await waitFor(() => approvals().length === 3);
+  assert.match(approvals()[2].text, /请求权限：Write: a\.ts\n1\. 允许一次\n2\. 本会话自动允许所有「edit 类操作」/);
   await reply('1');
   await run;
-  assert.deepEqual(results, ['opt-once', 'opt-once', 'opt-once']);
-  assert.equal(approvals().length, 2);
+  assert.deepEqual(results, ['opt-once', 'opt-once', 'opt-reject', 'opt-once']);
 
   // The grant is per tool: codex still asks.
   run = router.exec('u1', 'codex', 'third');
-  await waitFor(() => approvals().length === 3);
-  await reply('3');
-  await run;
-
-  // /new ends the session: the Bash grant is gone.
-  await router.handleSlash('u1', '/new');
-  requests.splice(0, requests.length, { title: 'Bash: npm test', options: FULL_OPTIONS });
-  run = router.exec('u1', 'claude', 'fourth');
   await waitFor(() => approvals().length === 4);
   await reply('3');
   await run;
-  assert.deepEqual(results.slice(3), ['opt-reject', 'opt-reject']);
+
+  // Still granted: no prompt.
+  requests.splice(0, requests.length, bash('npm test'));
+  await router.exec('u1', 'claude', 'again');
+  assert.equal(approvals().length, 4);
+
+  // /resume <id> and /new each end the session: the npm grant is gone.
+  for (const command of ['/resume abc', '/new']) {
+    await router.handleSlash('u1', command);
+    const asked = approvals().length;
+    run = router.exec('u1', 'claude', `after ${command}`);
+    await waitFor(() => approvals().length === asked + 1, `asks again after ${command}`);
+    await reply('2');
+    await run;
+  }
+  assert.deepEqual(results.slice(4), ['opt-reject', 'opt-once', 'opt-once', 'opt-once']);
+});
+
+test('the grant key narrows execute to the program and falls back to kind or tool name', async () => {
+  const { router } = createRouter({ claude: async () => ({ text: 'ok' }) });
+  const rule = (req: Partial<PermissionRequest>) => {
+    let seen = '';
+    const r = router as any;
+    // permissionRule is module-private: read it back through the prompt text.
+    return new Promise<string>((resolve) => {
+      r.ilink.sendText = async (_uid: string, text: string) => { seen = text; resolve(seen.split('\n').find((l: string) => l.startsWith('2. ')) ?? ''); };
+      void r.requestPermissionViaWeChat(`rule-${Math.random()}`, 'claude', { options: FULL_OPTIONS, ...req }, []);
+    });
+  };
+  assert.equal(await rule({ title: 'Run `git status`', kind: 'execute' }), '2. 本会话自动允许所有「git 命令」');
+  assert.equal(await rule({ title: 'npm install left-pad', kind: 'execute' }), '2. 本会话自动允许所有「npm 命令」');
+  assert.equal(await rule({ title: 'Fetch https://x', kind: 'fetch' }), '2. 本会话自动允许所有「fetch 类操作」');
+  assert.equal(await rule({ title: 'Skill: deploy' }), '2. 本会话自动允许所有「Skill 操作」');
+  router.stop();
 });
 
 test('a grant answers same-kind requests already waiting in the queue', async () => {
@@ -207,8 +235,8 @@ test('a grant answers same-kind requests already waiting in the queue', async ()
   const { router, approvals, reply } = createRouter({
     claude: async (_prompt, opts) => {
       results.push(...await Promise.all([
-        opts.requestPermission({ title: 'a', kind: 'execute', options: FULL_OPTIONS }),
-        opts.requestPermission({ title: 'b', kind: 'execute', options: FULL_OPTIONS }),
+        opts.requestPermission({ title: 'Run `npm test`', kind: 'execute', options: FULL_OPTIONS }),
+        opts.requestPermission({ title: 'Run `npm run lint`', kind: 'execute', options: FULL_OPTIONS }),
         opts.requestPermission({ title: 'c', kind: 'edit', options: FULL_OPTIONS }),
       ]));
       return { text: 'ok' };
@@ -225,15 +253,15 @@ test('a grant answers same-kind requests already waiting in the queue', async ()
   assert.deepEqual(results, ['opt-once', 'opt-once', 'opt-once']);
 });
 
-test('an invalid reply is re-prompted once, then the request is rejected', async () => {
+test('a wrong number is re-prompted once, then the request is rejected', async () => {
   const results: Array<string | null> = [];
   const { router, messages, calls, reply } = createRouter({ claude: approvingAdapter(results) });
 
   const run = router.exec('u1', 'claude', 'do it');
   await waitFor(() => messages.length === 1);
-  await reply('好的');
+  await reply('7');
   assert.match(messages.at(-1)!.text, /^请回复 1\/2\/3/);
-  await reply('随便吧');
+  await reply('9');
   await run;
 
   assert.deepEqual(results, [null]);
@@ -630,6 +658,23 @@ for (const mode of ['safe', 'auto'] as const) {
   });
 }
 
+test('safe mode does not hold back streaming for a tool that never asks in WeChat', async () => {
+  const { router, messages } = createRouter({
+    gemini: async (_prompt, opts) => {
+      opts.onIntermediate({ type: 'text', content: 'part one' });
+      opts.onIntermediate({ type: 'tool_use', content: '- Bash: ls' });
+      opts.onIntermediate({ type: 'text', content: 'part two' });
+      opts.onIntermediate({ type: 'tool_use', content: '- Bash: rm' });
+      for (let i = 0; i < 10; i++) await new Promise((resolve) => setImmediate(resolve));
+      return { text: 'part one\n\npart two\n\ndone' };
+    },
+  });
+  Object.assign(router.sessions.get('u1'), { mode: 'safe', msgMode: 'verbose' });
+  router.ilink.getDeliveryStatus = () => ({ quota: { generation: 1, remainingItems: Math.max(0, 3 - messages.length) }, pending: [], failed: [] });
+  await router.exec('u1', 'gemini', 'clean up');
+  assert.deepEqual(messages.slice(0, 3).map((m) => m.text), ['part one', 'Activity\n- Bash: ls', 'part two']);
+});
+
 test('nothing streams while a prompt is waiting for the user', async () => {
   const { router, messages, approvals, reply } = createRouter({
     claude: async (_prompt, opts) => {
@@ -650,4 +695,104 @@ test('nothing streams while a prompt is waiting for the user', async () => {
   await run;
   assert.ok(!messages.some((m) => m.text === 'while waiting'));
   assert.match(messages.at(-1)!.text, /^while waiting\n\nok/);
+});
+
+// ─── Review fixes: which messages count as answers ───────────────────────────
+
+test('A: @<other tool> while Claude waits on an AskUser question runs that tool, not an answer', async () => {
+  let answers: Record<string, string> | undefined;
+  const { router, calls, messages, reply } = createRouter({
+    claude: async (_prompt, opts) => {
+      answers = await opts.askUser({ questions: [{ question: 'Which DB?', options: [{ label: 'sqlite' }, { label: 'postgres' }] }] });
+      return { text: 'claude done' };
+    },
+    codex: async () => ({ text: 'tests passed' }),
+  });
+
+  const run = router.exec('u1', 'claude', 'set up db');
+  await waitFor(() => messages.length === 1);
+  await reply('@codex 跑一下测试');
+  await router.whenIdle();
+  assert.deepEqual(calls, ['claude:set up db', 'codex:跑一下测试']);
+  assert.equal(answers, undefined, 'the question is still open');
+
+  // The asking tool may be addressed explicitly; the mention is stripped from the answer.
+  await reply('@claude 2');
+  await run;
+  assert.deepEqual(answers, { 'Which DB?': 'postgres' });
+});
+
+test('B: @<other tool> messages during an approval run normally and leave the approval open', async () => {
+  const results: Array<string | null> = [];
+  const { router, calls, approvals, reply } = createRouter({
+    claude: approvingAdapter(results),
+    codex: async () => ({ text: 'ok' }),
+  });
+
+  const run = router.exec('u1', 'claude', 'do it');
+  await waitFor(() => approvals().length === 1);
+  await reply('@codex 看看 README');
+  await router.whenIdle();
+  await reply('@codex 再看看 CHANGELOG');
+  await router.whenIdle();
+  assert.deepEqual(calls, ['claude:do it', 'codex:看看 README', 'codex:再看看 CHANGELOG']);
+  assert.deepEqual(results, [], 'approval still pending, not rejected');
+
+  await reply('1');
+  await run;
+  assert.deepEqual(results, ['opt-once']);
+});
+
+test('ordinary text during an approval is not an answer: the waiting tool says the message did not run', async () => {
+  const results: Array<string | null> = [];
+  const { router, calls, messages, approvals, reply } = createRouter({ claude: approvingAdapter(results) });
+
+  const run = router.exec('u1', 'claude', 'do it');
+  await waitFor(() => approvals().length === 1);
+  await reply('现在进度怎么样');
+  assert.equal(messages.at(-1)!.text, 'Claude 正在等你审批（回复 1/2/3）。\n这条消息未执行，处理完后请重发。');
+  assert.deepEqual(results, []);
+  await reply('3');
+  await run;
+  assert.deepEqual(results, ['opt-reject']);
+  assert.deepEqual(calls, ['claude:do it']);
+});
+
+test('C: a question still queued in the outbox does not swallow the next message', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  let answers: Record<string, string> | undefined;
+  let delivered = false;
+  const { router, calls, messages, reply } = createRouter({
+    claude: async (_prompt, opts) => {
+      answers = await opts.askUser({ questions: [{ question: 'Proceed?', options: [{ label: 'yes' }, { label: 'no' }] }] });
+      return { text: 'ok' };
+    },
+    codex: async () => ({ text: 'ok' }),
+  });
+  // The prompt sits in the outbox (window exhausted) until `delivered` flips.
+  router.ilink.sendText = async (_uid: string, text: string, options?: any) => {
+    messages.push({ uid: 'u1', text, options });
+    options?.onEnqueued?.([{ itemId: `item-${messages.length}` }]);
+  };
+  router.ilink.getDeliveryStatus = () => ({
+    quota: { generation: 1 },
+    pending: delivered ? [] : [{ itemId: 'item-1' }],
+    failed: [],
+  });
+
+  const run = router.exec('u1', 'claude', 'go');
+  await waitFor(() => messages.length === 1);
+  await reply('现在进度怎么样');
+  assert.equal(answers, undefined, 'not taken as the answer');
+  assert.equal(messages.at(-1)!.text, 'Claude 有一条提问/审批还没送达微信（回复「继续」接收）。\n这条消息未执行，处理完后请重发。');
+  await reply('@codex hi');
+  await router.whenIdle();
+  assert.deepEqual(calls, ['claude:go', 'codex:hi']);
+
+  delivered = true;
+  t.mock.timers.tick(5_000); // the outbox check notices the delivery
+  assert.equal(router.interactions.get('u1')?.[0]?.delivered, true);
+  await reply('1');
+  await run;
+  assert.deepEqual(answers, { 'Proceed?': 'yes' });
 });

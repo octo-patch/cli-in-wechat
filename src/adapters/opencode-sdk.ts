@@ -302,6 +302,7 @@ export class OpenCodeAdapter implements CLIAdapter {
   readonly capabilities: AdapterCapabilities = {
     streaming: true, jsonOutput: true, sessionResume: true,
     modes: ['auto', 'safe', 'plan'], hasEffort: false, hasModel: true, hasSearch: false, hasBudget: false,
+    approvals: true,
   };
 
   // '' means "asked this server, it has no plan agent"; undefined means "not asked yet".

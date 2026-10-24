@@ -147,6 +147,7 @@ export class ClaudeAdapter implements CLIAdapter {
   readonly capabilities: AdapterCapabilities = {
     streaming: true, jsonOutput: true, sessionResume: true,
     modes: ['auto', 'safe', 'plan'], hasEffort: true, hasModel: true, hasSearch: false, hasBudget: true,
+    approvals: true,
   };
 
   constructor(
@@ -211,6 +212,8 @@ export class ClaudeAdapter implements CLIAdapter {
       let usage: ExecResult['usage'];
       let error = false;
       let resultSeen = false;
+      // The turn's own result came in before any idle stop (not one our interrupt provoked).
+      let resultBeforeStop = false;
       let stopReason: 'cancel' | 'timeout' | null = null;
       let stderr = '';
       let settled = false;
@@ -237,9 +240,12 @@ export class ClaudeAdapter implements CLIAdapter {
       // on a sudo password prompt) is stopped after `timeout` of silence.
       let idleTimer: ReturnType<typeof setTimeout> | null = null;
       let killTimer: ReturnType<typeof setTimeout> | null = null;
+      // Asks currently waiting on the user. While any is open the idle clock stays off: the CLI
+      // keeps writing keep_alive lines meanwhile, and those must not re-arm it.
+      let waitingOnUser = 0;
       const pauseIdle = (): void => { if (idleTimer) clearTimeout(idleTimer); idleTimer = null; };
       const armIdle = (): void => {
-        if (!opts.timeout || settled || stopReason) return;
+        if (!opts.timeout || settled || stopReason || waitingOnUser > 0) return;
         pauseIdle();
         idleTimer = setTimeout(() => stop('timeout'), opts.timeout);
       };
@@ -250,14 +256,22 @@ export class ClaudeAdapter implements CLIAdapter {
         pauseIdle();
         if (reason === 'timeout') log.warn(`[claude] 空闲超时 (${opts.timeout}ms 无消息)，发送 interrupt`);
         send({ type: 'control_request', request_id: `wx_interrupt_${++requestSeq}`, request: { subtype: 'interrupt' } });
-        killTimer = setTimeout(() => killProc(proc), this.interruptGraceMs);
+        // interrupt -> SIGTERM (taskkill /F on Windows) -> SIGKILL, one grace period apart.
+        killTimer = setTimeout(() => {
+          killProc(proc);
+          killTimer = setTimeout(() => {
+            if (proc.exitCode !== null || proc.signalCode !== null) return;
+            log.warn('[claude] SIGTERM 后进程仍未退出，发送 SIGKILL');
+            try { proc.kill('SIGKILL'); } catch { /* already gone */ }
+          }, this.interruptGraceMs);
+        }, this.interruptGraceMs);
       };
       const onAbort = (): void => { abortAsks(); stop('cancel'); };
       opts.signal?.addEventListener('abort', onAbort, { once: true });
 
       const answerPermission = async (requestId: string, req: CanUseToolRequest): Promise<void> => {
         const waitsOnUser = req.tool_name === 'AskUserQuestion' || (settings.mode === 'safe' && !!opts.requestPermission);
-        if (waitsOnUser) pauseIdle(); // waiting on the user is not the agent going idle
+        if (waitsOnUser) { waitingOnUser++; pauseIdle(); } // waiting on the user is not the agent going idle
         const ask = new AbortController();
         pendingAsks.set(requestId, ask);
         let decision: PermissionDecision;
@@ -269,7 +283,7 @@ export class ClaudeAdapter implements CLIAdapter {
           decision = { behavior: 'deny', message: `权限处理出错：${(err as Error).message}` };
         }
         pendingAsks.delete(requestId);
-        if (waitsOnUser) armIdle();
+        if (waitsOnUser) { waitingOnUser--; armIdle(); }
         if (cancelledRequests.delete(requestId)) return;
         send({
           type: 'control_response',
@@ -333,6 +347,7 @@ export class ClaudeAdapter implements CLIAdapter {
           }
           case 'result':
             resultSeen = true;
+            if (!stopReason) resultBeforeStop = true;
             sessionId = msg.session_id || sessionId;
             if (typeof msg.total_cost_usd === 'number') cost = msg.total_cost_usd;
             if (msg.usage) {
@@ -388,7 +403,10 @@ export class ClaudeAdapter implements CLIAdapter {
       proc.on('close', (code) => {
         const duration = Date.now() - start;
         if (stopReason === 'cancel') { finish({ text: '已取消', sessionId, cost, duration, error: true }); return; }
-        if (stopReason === 'timeout') {
+        // A result that is the real answer wins over the timeout notice: one that arrived before the
+        // idle stop fired (the CLI was just slow to exit), or a successful one that raced it. An
+        // error result provoked by our interrupt is reported as the timeout it is.
+        if (stopReason === 'timeout' && !(resultSeen && (resultBeforeStop || !error))) {
           const mins = Math.round((opts.timeout ?? 0) / 60000);
           finish({
             text: `执行超时（${mins} 分钟无响应），已自动中止。\n可能是某个命令在等待输入（如 sudo 密码）。`,
