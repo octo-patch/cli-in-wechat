@@ -31,7 +31,16 @@ export function resolveAgentAdapters(agents: unknown, presets: AcpPreset[] = ACP
     if (NATIVE_NAMES.has(a.name)) { bad('与内置工具重名'); continue; }
     const base = merged.get(a.name);
     if (a.disabled === true) { merged.delete(a.name); continue; }
-    const next: AgentConfig = { ...base, ...a } as AgentConfig;
+    let inherited = base;
+    if (base && a.protocol && a.protocol !== base.protocol) {
+      // A preset's args/modeIds belong to its old protocol; don't carry them over silently.
+      const { args: _args, modeIds: _modeIds, ...rest } = base;
+      inherited = rest;
+      if ((a.args === undefined && base.args?.length) || (a.protocol === 'acp' && base.modeIds && a.modeIds === undefined)) {
+        log.warn(`[config] agents 条目 ${a.name} 把 protocol 从 ${base.protocol} 改为 ${a.protocol}，未继承预设的 args/modeIds`);
+      }
+    }
+    const next: AgentConfig = { ...inherited, ...a } as AgentConfig;
     next.protocol ??= 'acp';
     if (next.protocol !== 'acp' && next.protocol !== 'text') { bad('protocol 须为 acp 或 text'); continue; }
     if (typeof next.command !== 'string' || !next.command.trim()) { bad('command 不能为空'); continue; }

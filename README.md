@@ -236,6 +236,7 @@ Claude Code 需要你做选择时，问题自动转发到微信：
 
 > `name` 只能用小写字母、数字和 `-`，不能与 claude/codex/gemini/kimi/opencode 重名；`env` 可追加环境变量。
 > 写错的条目只会在启动日志里警告并跳过，不影响其他工具。
+> Windows 下 `promptVia: "arg"` 要求命令能直接定位到 .exe/.js（不经过 cmd.exe），否则为防注入会拒绝执行，请改用 stdin。
 
 ## 网络与代理（故障排查）
 

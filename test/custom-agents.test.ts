@@ -4,7 +4,7 @@ import { EventEmitter } from 'node:events';
 import { PassThrough } from 'node:stream';
 import type { ChildProcess, SpawnOptions } from 'node:child_process';
 
-import { DEFAULT_SETTINGS } from '../src/adapters/base.js';
+import { DEFAULT_SETTINGS, spawnCli, ShellFallbackRefusedError, type SpawnCliOptions } from '../src/adapters/base.js';
 import { AcpAdapter } from '../src/adapters/acp/adapter.js';
 import { ACP_PRESETS } from '../src/adapters/acp/presets.js';
 import { TextAdapter, type TextAgentSpec, type TextSpawn } from '../src/adapters/text.js';
@@ -78,6 +78,26 @@ test('merge: override preset fields, disable presets, add new acp and text agent
   assert.equal(text.capabilities.sessionResume, false);
 });
 
+test('merge: changing a preset\'s protocol drops its args/modeIds unless given, with a warning', (t) => {
+  const warn = t.mock.method(log, 'warn', () => {});
+  const all = byName(resolveAgentAdapters([
+    { name: 'qwen', protocol: 'text' },
+    { name: 'cursor', protocol: 'text', args: ['-p', '{prompt}'], promptVia: 'arg' },
+    { name: 'qoder', protocol: 'acp', command: 'qoder' },
+  ]));
+  const qwen = all.get('qwen') as TextAdapter;
+  assert.ok(qwen instanceof TextAdapter);
+  assert.equal(qwen.command, 'qwen', 'command is still inherited');
+  assert.deepEqual(qwen.spec.args, [], 'preset ACP args dropped');
+  const cursor = all.get('cursor') as TextAdapter;
+  assert.deepEqual(cursor.spec.args, ['-p', '{prompt}']);
+  assert.equal(cursor.spec.promptVia, 'arg');
+  const qoder = all.get('qoder') as AcpAdapter;
+  assert.deepEqual(qoder.preset.args, ACP_PRESETS.find((p) => p.name === 'qoder')!.args, 'same protocol keeps args');
+  assert.equal(warn.mock.callCount(), 1, 'only qwen (args dropped silently otherwise) warns');
+  assert.match(String(warn.mock.calls[0].arguments[0]), /qwen.*protocol/);
+});
+
 test('registry registers config agents alongside native adapters', (t) => {
   t.mock.method(log, 'warn', () => {});
   const registry = new AdapterRegistry([
@@ -90,13 +110,13 @@ test('registry registers config agents alongside native adapters', (t) => {
   assert.ok(all.has('claude') && all.has('qwen'));
 });
 
-interface Capture { command?: string; args?: string[]; options?: SpawnOptions; stdin: string; killed: number }
+interface Capture { command?: string; args?: string[]; options?: SpawnOptions; cliOpts?: SpawnCliOptions; stdin: string; killed: number }
 
 /** Fake child: answers with `stdout`/`stderr`/`code` unless `hang`, in which case it only exits when killed. */
 function fakeSpawn(opts: { stdout?: string; stderr?: string; code?: number; hang?: boolean }) {
   const capture: Capture = { stdin: '', killed: 0 };
-  const spawn: TextSpawn = (command, args, options) => {
-    Object.assign(capture, { command, args: [...args], options });
+  const spawn: TextSpawn = (command, args, options, cliOpts) => {
+    Object.assign(capture, { command, args: [...args], options, cliOpts });
     const child = new EventEmitter() as unknown as ChildProcess;
     const stdin = new PassThrough(), stdout = new PassThrough(), stderr = new PassThrough();
     stdin.setEncoding('utf8');
@@ -138,6 +158,7 @@ test('text: prompt on stdin, stdout ANSI-stripped, env and cwd passed', async ()
   assert.equal(r.text, 'hello 世界');
   assert.equal(r.error, undefined);
   assert.equal(r.sessionId, undefined);
+  assert.equal(fake.capture.cliOpts?.strict, false, 'stdin mode keeps the normal shim fallback');
 });
 
 test('text: promptVia arg substitutes {prompt} in argv verbatim, stdin unused', async () => {
@@ -149,6 +170,7 @@ test('text: promptVia arg substitutes {prompt} in argv verbatim, stdin unused', 
   assert.equal((fake.capture.options?.stdio as string[])[0], 'ignore');
   assert.equal(fake.capture.stdin, '');
   assert.equal(r.text, 'ok');
+  assert.equal(fake.capture.cliOpts?.strict, true, 'argv prompt must never fall back to cmd.exe');
 
   const noPlaceholder = fakeSpawn({ stdout: 'ok' });
   await new TextAdapter(spec({ args: ['-p'], promptVia: 'arg' }), noPlaceholder.spawn).execute('q', { settings });
@@ -204,4 +226,23 @@ test('text: spawn failure resolves with an error instead of throwing', async () 
   const r = await new TextAdapter(spec(), throwing).execute('q', { settings });
   assert.equal(r.error, true);
   assert.match(r.text, /无法启动 My Text: ENOENT/);
+});
+
+test('spawnCli strict: on Windows an unresolvable command throws instead of using cmd.exe', () => {
+  const evil = 'hi" & del /q C:\\x & "';
+  assert.throws(
+    () => spawnCli('mystery', ['--msg', evil], {}, { strict: true, win: true, resolveTarget: () => null }),
+    (e: unknown) => e instanceof ShellFallbackRefusedError && e.command === 'mystery',
+  );
+});
+
+test('text: arg mode reports a readable error when strict spawn refuses', async () => {
+  const refusing: TextSpawn = (cmd, _args, _opts, cliOpts) => {
+    assert.equal(cliOpts?.strict, true);
+    throw new ShellFallbackRefusedError(cmd);
+  };
+  const r = await new TextAdapter(spec({ args: ['{prompt}'], promptVia: 'arg' }), refusing).execute('hi" & calc & "', { settings });
+  assert.equal(r.error, true);
+  assert.match(r.text, /命令注入/);
+  assert.match(r.text, /"promptVia": "stdin"/);
 });

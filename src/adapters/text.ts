@@ -1,6 +1,6 @@
 import { log } from '../utils/logger.js';
 import type { CLIAdapter, ExecOptions, ExecResult, AdapterCapabilities } from './base.js';
-import { commandExists, spawnCli, killProc, setupAbort, writeStdin, stripAnsi, buildMediaPrompt, collectUtf8 } from './base.js';
+import { commandExists, spawnCli, ShellFallbackRefusedError, killProc, setupAbort, writeStdin, stripAnsi, buildMediaPrompt, collectUtf8 } from './base.js';
 
 /**
  * Minimal adapter for any plain-text CLI declared in config.json (`protocol: "text"`):
@@ -8,8 +8,9 @@ import { commandExists, spawnCli, killProc, setupAbort, writeStdin, stripAnsi, b
  * no session resume, /mode is always auto. Exit code ≠ 0 is an error.
  *
  * The prompt goes on stdin (default) or, with `promptVia: "arg"`, replaces every "{prompt}"
- * placeholder in args (appended as the last arg when there is none). spawnCli keeps an argv
- * prompt verbatim on Windows (no cmd.exe re-parsing).
+ * placeholder in args (appended as the last arg when there is none). The argv form uses
+ * spawnCli in strict mode: on Windows it refuses (rather than run the WeChat text through
+ * cmd.exe) when the command can't be resolved to a direct .exe/.js target.
  */
 export interface TextAgentSpec {
   name: string;
@@ -63,8 +64,16 @@ export class TextAdapter implements CLIAdapter {
       try {
         proc = this.spawnAgent(this.command, args, {
           cwd: workDir, stdio: [viaArg ? 'ignore' : 'pipe', 'pipe', 'pipe'], env: { ...process.env, ...this.spec.env },
-        });
+        }, { strict: viaArg });
       } catch (e) {
+        if (e instanceof ShellFallbackRefusedError) {
+          done({
+            text: `${this.displayName}: Windows 下无法安全地把消息作为参数传给 ${this.command}（找不到可直接启动的 .exe/.js，`
+              + '走 cmd.exe 会有命令注入风险），已拒绝执行。请在 config.json 里改用 "promptVia": "stdin"。',
+            error: true,
+          });
+          return;
+        }
         done({ text: `无法启动 ${this.displayName}: ${(e as Error).message}`, error: true });
         return;
       }
