@@ -135,7 +135,7 @@ export class Router {
   private interactions = new Map<string, PendingInteraction[]>();
   /** When a user's last interaction expired unanswered (timeout / cancel), for late-reply hints. */
   private expiredInteractions = new Map<string, number>();
-  /** "本会话总是允许" grants: `${uid}:${tool}` → rule keys (see permissionRuleKey). Memory only. */
+  /** "本会话自动允许" grants: `${uid}:${tool}` → rule keys (see permissionRule). Memory only. */
   private sessionGrants = new Map<string, Set<string>>();
   private _lastSessionList: Array<{ id: string; date: string; summary: string }> | null = null;
   private readonly tasks: InboundTaskStore;
@@ -1180,7 +1180,7 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
         this.sessions.update(uid, { mode: v as any });
         const desc: Record<string, string> = {
           auto: 'AUTO\nClaude: --dangerously-skip-permissions\nCodex: --yolo\nGemini: --approval-mode yolo\nKimi: -p (自带auto)',
-          safe: 'SAFE = 每次敏感操作在微信里问你\n回 1 允许一次 / 2 本会话总是允许此类操作 / 3 拒绝，5 分钟无回复自动拒绝\n(需工具支持审批；Codex: 在 workspace-write 沙箱内执行；Kimi: /mode 无效)',
+          safe: 'SAFE = 每次敏感操作在微信里问你\n回 1 允许一次 / 2 本会话自动允许同类（同一程序的命令或同类操作，提示里写明范围） / 3 拒绝，5 分钟无回复自动拒绝\n(需工具支持审批；Codex: 在 workspace-write 沙箱内执行；Kimi: /mode 无效)',
           plan: 'PLAN\nClaude: --permission-mode plan\nCodex: --sandbox read-only\nGemini: --approval-mode plan\nKimi: -p 不支持plan (恒auto)',
         };
         await reply(desc[v]);
