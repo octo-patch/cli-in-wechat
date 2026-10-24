@@ -6,6 +6,8 @@ import { GeminiAdapter } from './gemini.js';
 import { KimiAdapter } from './kimi.js';
 import { OpenCodeAdapter } from './opencode-sdk.js';
 import { OpenCodeAdapter as OpenCodeCliAdapter } from './opencode.js';
+import { AcpAdapter } from './acp/adapter.js';
+import { ACP_PRESETS } from './acp/presets.js';
 
 export class AdapterRegistry {
   private adapters = new Map<string, CLIAdapter>();
@@ -23,6 +25,8 @@ export class AdapterRegistry {
     this.register(new OpenCodeAdapter());
     this.register(new OpenCodeCliAdapter(), 'opencode-cli');
     this.fallbackChains.set('opencode', ['opencode-cli']);
+    // Generic ACP agents (Qwen Code, Copilot, Cursor, CodeBuddy, Droid, Devin, Qoder, MiniMax)
+    for (const preset of ACP_PRESETS) this.register(new AcpAdapter(preset));
   }
 
   private register(adapter: CLIAdapter, fallbackName?: string): void {
