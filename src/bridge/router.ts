@@ -10,7 +10,14 @@ import { SessionManager } from './session.js';
 import { formatResponse } from './formatter.js';
 import type { WeixinMessage } from '../ilink/types.js';
 import type { BridgeConfig } from '../config.js';
-import { DEFAULT_SETTINGS, type AskUserRequest, type MsgMode, type PermissionRequest } from '../adapters/base.js';
+import {
+  DEFAULT_SETTINGS,
+  type AdapterCapabilities,
+  type AskUserRequest,
+  type MsgMode,
+  type PermissionRequest,
+  type UserSettings,
+} from '../adapters/base.js';
 import type { DownloadedMedia } from '../utils/media.js';
 import type { OutboxItem } from '../ilink/outbox.js';
 import {
@@ -120,6 +127,94 @@ const SHORT_ALIASES: Record<string, string> = {
   cc: 'claude', cx: 'codex', gm: 'gemini', km: 'kimi', oc: 'opencode',
 };
 
+/**
+ * Per-tool switches behind `/set <key> <value>`. `tools` lists the adapters that read the
+ * field (omitted = bridge-side, applies to every tool); `/set` and `/status` show only the
+ * keys relevant to the current tool.
+ */
+interface SettingDef {
+  key: string;
+  field: keyof UserSettings;
+  type: 'bool' | 'int' | 'money' | 'text' | 'enum';
+  hint: string;
+  tools?: string[];
+  /** enum: typed value → stored value ('' = unset). */
+  values?: Record<string, string>;
+}
+
+const SETTINGS: SettingDef[] = [
+  { key: 'msgmode', field: 'msgMode', type: 'enum', hint: 'verbose|normal|compact 消息详细度',
+    values: { verbose: 'verbose', detailed: 'verbose', normal: 'normal', compact: 'compact', simple: 'compact', default: DEFAULT_SETTINGS.msgMode } },
+  { key: 'thoughts', field: 'showThoughts', type: 'bool', hint: '显示 AI 思考内容' },
+  { key: 'system', field: 'systemPrompt', type: 'text', hint: '追加系统提示', tools: ['claude'] },
+  { key: 'turns', field: 'maxTurns', type: 'int', hint: '最大轮次', tools: ['claude'] },
+  { key: 'budget', field: 'maxBudget', type: 'money', hint: '预算美元 (off=无限)', tools: ['claude'] },
+  { key: 'tools', field: 'allowedTools', type: 'text', hint: '允许的工具 (逗号分隔)', tools: ['claude'] },
+  { key: 'notool', field: 'disallowedTools', type: 'text', hint: '禁用的工具 (逗号分隔)', tools: ['claude'] },
+  { key: 'bare', field: 'bare', type: 'bool', hint: '跳过配置加载', tools: ['claude'] },
+  { key: 'name', field: 'sessionName', type: 'text', hint: '会话命名', tools: ['claude'] },
+  { key: 'adddir', field: 'addDir', type: 'text', hint: '额外目录', tools: ['claude', 'codex', 'kimi'] },
+  // Codex takes the level; Gemini's --sandbox is on/off, so any level turns it on there.
+  { key: 'sandbox', field: 'sandbox', type: 'enum', hint: 'read-only|write|full|off 沙箱 (覆盖 /mode；Gemini 只分开/关)', tools: ['codex', 'gemini'],
+    values: {
+      ro: 'read-only', 'read-only': 'read-only', readonly: 'read-only',
+      ws: 'workspace-write', 'workspace-write': 'workspace-write', write: 'workspace-write',
+      full: 'danger-full-access', 'danger-full-access': 'danger-full-access', danger: 'danger-full-access',
+      off: '', reset: '',
+    } },
+  { key: 'search', field: 'search', type: 'bool', hint: 'web 搜索', tools: ['codex'] },
+  { key: 'ephemeral', field: 'ephemeral', type: 'bool', hint: '临时会话 (不落盘)', tools: ['codex'] },
+  { key: 'profile', field: 'profile', type: 'text', hint: 'config profile', tools: ['codex'] },
+  { key: 'approval', field: 'approvalMode', type: 'enum', hint: 'default|auto_edit|yolo|plan|off 覆盖 /mode', tools: ['gemini'],
+    values: { default: 'default', auto_edit: 'auto_edit', yolo: 'yolo', plan: 'plan', off: '', reset: '' } },
+  { key: 'include', field: 'includeDirs', type: 'text', hint: '额外上下文目录', tools: ['gemini'] },
+  { key: 'ext', field: 'extensions', type: 'text', hint: '扩展', tools: ['gemini'] },
+];
+
+/** 0.2.0 slimming, kept for one release: old command → /set key. The old form still works. */
+const MOVED_TO_SET: Record<string, string> = {
+  msgmode: 'msgmode', thoughts: 'thoughts', system: 'system', sys: 'system',
+  turns: 'turns', t: 'turns', budget: 'budget', b: 'budget', tools: 'tools', notool: 'notool',
+  bare: 'bare', name: 'name', adddir: 'adddir', 'add-dir': 'adddir',
+  sandbox: 'sandbox', sb: 'sandbox', search: 'search', ephemeral: 'ephemeral', profile: 'profile',
+  approval: 'approval', include: 'include', inc: 'include', ext: 'ext', extensions: 'ext',
+};
+
+/** 0.2.0 slimming, kept for one release: removed command → what to do instead. */
+const REMOVED_COMMANDS: Record<string, string> = {
+  verbose: '已移除（Kimi 新版没有 --verbose）', v: '已移除（Kimi 新版没有 --verbose）',
+  thinking: '已移除（Kimi 新版没有 --thinking）',
+  yolo: '已移除，请用 /mode auto 和 /effort max', fast: '已移除，请用 /effort low',
+  plan: '已移除，请用 /mode plan', fork: '已移除，请用 /new', branch: '已移除，请用 /new',
+  continue: '已移除，请用 /resume', session: '已移除，请用 /resume（/resume <id> 直接指定会话）',
+  init: '已移除，直接把需求发给工具即可', files: '已移除，直接把需求发给工具即可',
+};
+
+const MODE_MEANING: Record<string, string> = {
+  auto: 'AUTO = 最高权限，不询问',
+  safe: 'SAFE = 每次敏感操作在微信里问你\n回 1 允许一次 / 2 本会话自动允许同类（同一程序的命令或同类操作，提示里写明范围） / 3 拒绝，5 分钟无回复自动拒绝',
+  plan: 'PLAN = 只读，只规划不改动',
+};
+
+/** How each built-in tool realises /mode; other tools (ACP, config agents) map it themselves. */
+const MODE_NOTES: Record<string, Record<string, string>> = {
+  claude: { auto: 'bypass：跳过全部权限确认', safe: '需确认的工具调用发到微信审批', plan: '--permission-mode plan，不能改文件' },
+  codex: {
+    auto: '--dangerously-bypass-approvals-and-sandbox（无沙箱）',
+    safe: 'workspace-write 沙箱内自动执行（exec 没有审批通道，不会问你）',
+    plan: '--sandbox read-only',
+  },
+  gemini: {
+    auto: '--approval-mode yolo', safe: '--approval-mode default（非交互模式下需确认的操作会被拒绝）', plan: '--approval-mode plan',
+  },
+  kimi: { auto: '-p 模式恒为 auto', safe: '-p 模式恒为 auto，/mode 对 Kimi 无效', plan: '-p 模式恒为 auto，/mode 对 Kimi 无效' },
+};
+
+/** Session-id sentinels older adapters stored instead of a real id (codex `--last`, kimi `--continue`). */
+const LEGACY_SESSION_SENTINELS: Record<string, string> = { codex: 'last', kimi: 'continue' };
+
+const THOUGHTS_VERBOSE_WARNING = '⚠️ 高频交互任务（如浏览器操作）不建议同时开启 thoughts 和 msgmode verbose，可能触发 iLink 限流，通常约 2-3 分钟恢复。';
+
 const NORMAL_ACTIVITY_MAX_LINES_PER_MESSAGE = 12;
 const NORMAL_ACTIVITY_MAX_CHARS_PER_MESSAGE = 1400;
 const NORMAL_ACTIVITY_SPLIT_DELAY_MS = 5000;
@@ -137,7 +232,11 @@ export class Router {
   private expiredInteractions = new Map<string, number>();
   /** "本会话自动允许" grants: `${uid}:${tool}` → rule keys (see permissionRule). Memory only. */
   private sessionGrants = new Map<string, Set<string>>();
-  private _lastSessionList: Array<{ id: string; date: string; summary: string }> | null = null;
+  /**
+   * The list each user last got from `/resume` for a tool (keyed `uid:tool`), with the workDir it
+   * was listed for, so `/resume <编号>` never picks from another user's, tool's or directory's list.
+   */
+  private lastSessionLists = new Map<string, { workDir: string; items: Array<{ id: string; date: string; summary: string }> }>();
   private readonly tasks: InboundTaskStore;
   private readonly bootId: string;
   /** In-process runner registry: at most one background runner per task id. */
@@ -985,6 +1084,166 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
 
   // ─── /command → ALL are commands, never pass through ────
 
+  private currentTool(uid: string): string {
+    return this.sessions.get(uid).defaultTool || this.config.defaultTool;
+  }
+
+  private toolCapabilities(tool: string): Partial<AdapterCapabilities> {
+    return this.registry.get(tool)?.capabilities ?? {};
+  }
+
+  /** /set keys the given tool reads (bridge-side keys apply to every tool). */
+  private settingsFor(tool: string): SettingDef[] {
+    return SETTINGS.filter((def) => !def.tools || def.tools.includes(tool));
+  }
+
+  private formatSetting(def: SettingDef, settings: UserSettings): string {
+    const value = settings[def.field] as unknown;
+    if (def.type === 'bool') return value ? 'ON' : 'OFF';
+    if (def.type === 'money') return Number(value) > 0 ? `$${value}` : '无限';
+    if (value === '' || value === undefined || value === null) return '无';
+    return String(value);
+  }
+
+  /** `/set` → text of the reply. Bare `/set` lists the current tool's keys with their values. */
+  private applySet(uid: string, arg: string): string {
+    const settings = this.sessions.get(uid);
+    const tool = this.currentTool(uid);
+    const [rawKey = '', ...rest] = arg.split(/\s+/).filter(Boolean);
+    const key = rawKey.toLowerCase();
+    const value = rest.join(' ').trim();
+    if (!key || key === 'all') {
+      const defs = key === 'all' ? SETTINGS : this.settingsFor(tool);
+      const lines = defs.map((def) => `${def.key} = ${this.formatSetting(def, settings)}  — ${def.hint}${key === 'all' && def.tools ? ` (${def.tools.join('/')})` : ''}`);
+      return `${key === 'all' ? '全部设置' : `${tool} 的设置`}:\n${lines.join('\n')}\n\n/set <键> <值> 修改${key === 'all' ? '' : '，/set all 查看所有工具'}`;
+    }
+    const def = SETTINGS.find((d) => d.key === key);
+    if (!def) return `未知设置: ${rawKey}\n/set 查看可设项`;
+
+    let next: unknown;
+    const lower = value.toLowerCase();
+    switch (def.type) {
+      case 'bool':
+        // No value toggles, like the old one-word commands did.
+        if (!value) next = !settings[def.field];
+        else if (['on', 'true', '1', 'yes', '开'].includes(lower)) next = true;
+        else if (['off', 'false', '0', 'no', '关'].includes(lower)) next = false;
+        else return `${def.key} 只接受 on/off\n当前: ${this.formatSetting(def, settings)}`;
+        break;
+      case 'int': {
+        const n = Number(value);
+        if (!value || !Number.isInteger(n) || n < 1) return `当前: ${def.key} = ${this.formatSetting(def, settings)}\n/set ${def.key} <正整数>  ${def.hint}`;
+        next = n;
+        break;
+      }
+      case 'money': {
+        if (!value) return `当前: ${def.key} = ${this.formatSetting(def, settings)}\n/set ${def.key} <美元> 或 off`;
+        const n = lower === 'off' ? 0 : Number(value);
+        if (!Number.isFinite(n) || n < 0) return `/set ${def.key} <美元> 或 off`;
+        next = n;
+        break;
+      }
+      case 'text':
+        if (!value) return `当前: ${def.key} = ${this.formatSetting(def, settings)}\n/set ${def.key} <值>（off 清除）  ${def.hint}`;
+        next = ['off', 'reset', 'clear'].includes(lower) ? '' : value;
+        break;
+      case 'enum':
+        next = def.values![lower];
+        if (next === undefined) {
+          return `${value ? `无效值: ${value}\n` : ''}当前: ${def.key} = ${this.formatSetting(def, settings)}\n/set ${def.key} <${def.hint.split(' ')[0]}>`;
+        }
+        break;
+    }
+    this.sessions.update(uid, { [def.field]: next } as Partial<UserSettings>);
+    const lines = [`${def.key} → ${this.formatSetting(def, this.sessions.get(uid))}`];
+    if (def.tools && !def.tools.includes(tool)) lines.push(`(当前工具 ${tool} 不使用此项，对 ${def.tools.join('/')} 生效)`);
+    const now = this.sessions.get(uid);
+    if ((def.key === 'msgmode' || def.key === 'thoughts') && now.showThoughts && this.normalizeMsgMode(now.msgMode) === 'verbose') {
+      lines.push('', THOUGHTS_VERBOSE_WARNING);
+    }
+    return lines.join('\n');
+  }
+
+  private helpText(uid: string): string {
+    const tool = this.currentTool(uid);
+    const caps = this.toolCapabilities(tool);
+    const tools = this.availableTools();
+    const shortcuts = tools.filter((t) => t.short).map((t) => `/${t.short}`).join(' ');
+    const keys = this.settingsFor(tool).map((def) => def.key).join(' ');
+    return [
+      `=== cli-in-wechat 命令 (当前: ${this.registry.get(tool)?.displayName ?? tool}) ===`,
+      '',
+      '— 工具 —',
+      `/use [名字]  切工具/列出可用 (${tools.map((t) => t.name).join(' ') || '无'})`,
+      ...(shortcuts ? [`${shortcuts}  快捷切换`] : []),
+      '/status  当前配置',
+      '',
+      '— 设置 —',
+      ...(caps.hasModel ? ['/model <名|default>  切模型'] : []),
+      ...(tool === 'opencode' ? ['/models  查看可用模型'] : []),
+      ...(caps.modes?.length ? [`/mode <${caps.modes.join('|')}>  权限`] : []),
+      ...(caps.hasEffort ? ['/effort <low|med|high|xhigh|max>  深度'] : []),
+      '/dir <路径>  工作目录',
+      `/set [键] [值]  其他设置 (${keys})`,
+      '/reset  重置所有设置',
+      '',
+      '— 会话 —',
+      '/new  新会话',
+      ...(caps.sessionResume ? ['/resume [编号|id]  历史会话'] : []),
+      '/cancel  取消任务',
+      '/tasks [ack]  查看/确认中断的任务',
+      '/send <路径>  发送文件到微信',
+      '/diff /commit /review  常用操作',
+      '/stats  上次回复统计',
+      '',
+      '— 发消息 —',
+      '@<工具名>  单次指定工具',
+      '>>  接力(传上条结果)',
+      '@tool1>tool2  链式调用',
+    ].join('\n');
+  }
+
+  private statusText(uid: string): string {
+    const settings = this.sessions.get(uid);
+    const tool = this.currentTool(uid);
+    const caps = this.toolCapabilities(tool);
+    const displayName = this.registry.get(tool)?.displayName;
+    const sessionId = settings.sessionIds?.[tool];
+    const changed = this.settingsFor(tool)
+      .filter((def) => def.key !== 'msgmode' && def.key !== 'thoughts'
+        && settings[def.field] !== undefined && settings[def.field] !== DEFAULT_SETTINGS[def.field])
+      .map((def) => `${def.key}=${this.formatSetting(def, settings)}`);
+    const lines = [
+      `工具: ${tool}${displayName ? ` (${displayName})` : ''}`,
+      `模式: ${settings.mode ?? DEFAULT_SETTINGS.mode}`,
+      ...(caps.hasModel ? [`model: ${settings.model || '默认'}`] : []),
+      ...(caps.hasEffort ? [`effort: ${settings.effort ?? DEFAULT_SETTINGS.effort}`] : []),
+      `msgMode: ${this.normalizeMsgMode(settings.msgMode)} (默认: ${this.getDefaultMsgMode()})  thoughts: ${settings.showThoughts ? 'ON' : 'OFF'}`,
+      ...(changed.length > 0 ? [`设置: ${changed.join(' ')}`] : []),
+      `dir: ${settings.workDir || this.config.workDir}`,
+      ...(caps.sessionResume ? [`会话: ${sessionId ? String(sessionId).substring(0, 12) : '无'}`] : []),
+      `可用: ${this.availableToolList()}`,
+    ];
+    const getDeliveryStatus = (this.ilink as ILinkClient & {
+      getDeliveryStatus?: (userId: string) => {
+        quota: { sentItems: number; remainingItems: number; maxItemsPerWindow: number; rateBackoffUntil: number };
+        pending: unknown[];
+        failed: unknown[];
+      };
+    }).getDeliveryStatus;
+    if (getDeliveryStatus) {
+      const delivery = getDeliveryStatus.call(this.ilink, uid);
+      const backoff = delivery.quota.rateBackoffUntil > Date.now() ? 'backoff' : 'ready';
+      lines.push(`delivery: pending=${delivery.pending.length} failed=${delivery.failed.length} sent=${delivery.quota.sentItems}/${delivery.quota.maxItemsPerWindow} remaining=${delivery.quota.remainingItems} ${backoff}`);
+    }
+    const openTasks = this.tasks.list({ userId: uid, phases: ['delivery-pending', 'recovery-required'] });
+    if (openTasks.length > 0) {
+      const count = (phase: string) => openTasks.filter((task) => task.phase === phase).length;
+      lines.push(`tasks: delivery-pending=${count('delivery-pending')} recovery-required=${count('recovery-required')} (/tasks)`);
+    }
+    return lines.join('\n');
+  }
+
   private async handleSlash(uid: string, text: string, taskGeneration?: number, run?: TaskRun): Promise<boolean> {
     const parts = text.substring(1).split(/\s+/);
     const cmd = parts[0].toLowerCase();
@@ -992,120 +1251,29 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
     const settings = this.sessions.get(uid);
     const reply = (msg: string) => this.ilink.sendText(uid, msg);
 
+    // Old per-CLI switches still work for one release, with a pointer to the new form.
+    if (MOVED_TO_SET[cmd]) {
+      const key = MOVED_TO_SET[cmd];
+      await reply(`(/${cmd} 已改为 /set ${key})\n${this.applySet(uid, `${key} ${arg}`)}`);
+      return true;
+    }
+    if (REMOVED_COMMANDS[cmd]) {
+      await reply(`/${cmd} ${REMOVED_COMMANDS[cmd]}`);
+      return true;
+    }
+
     switch (cmd) {
-      // ═══════════════════════════════════════════
-      // 通用
-      // ═══════════════════════════════════════════
-
-      case 'help': case 'h': {
-        const tools = this.availableTools();
-        const shortcuts = tools.filter((tool) => tool.short).map((tool) => `/${tool.short}`).join(' ');
-        await reply([
-          '=== cli-in-wechat 命令 ===',
-          '',
-          '— 设置 —',
-          '/status  查看所有配置',
-          '/models  查看可用模型',
-          '/model <名>  切模型',
-          '/mode <auto|safe|plan>  权限',
-          '/effort <low|med|high|xhigh|max>  深度',
-          '/turns <数>  最大轮次',
-          '/budget <$>  预算(off=无限)',
-          '/dir <路径>  工作目录',
-          '/system <词>  追加系统提示',
-          '/tools <列表>  允许工具',
-          '/notool <列表>  禁用工具',
-          '/verbose  已弃用(Kimi 新版无 --verbose)',
-          '/bare  跳过配置加载',
-          '/adddir <路径>  额外目录',
-          '/name <名>  会话命名',
-          '/sandbox <ro|write|full>  沙箱',
-          '/search  web搜索(Codex)',
-          '/ephemeral  临时模式(Codex)',
-          '/profile <名>  配置(Codex)',
-          '/approval <模式>  审批(Gemini)',
-          '/include <目录>  上下文(Gemini)',
-          '/ext <名>  扩展(Gemini)',
-          '/thinking  已弃用(Kimi 新版无 --thinking)',
-          '/thoughts  显示AI思考内容',
-          '/msgmode <verbose|normal|compact|default>  消息详细度',
-          '',
-          '— 操作 —',
-          '/diff  查看git差异',
-          '/commit  创建git提交',
-          '/review  代码审查',
-          '/plan [描述]  规划模式/制定计划',
-          '/init  创建项目配置文件',
-          '/files  列出目录结构',
-          '/compact  压缩上下文(清session)',
-          '/stats  使用统计',
-          '/send <文件路径>  发送文件到微信',
-          '',
-          '— 会话 —',
-          '/new  新会话',
-          '/clear  清除所有',
-          '/cancel  取消任务',
-          '/tasks [ack]  查看/确认中断的任务',
-          '/fork  分支当前会话',
-          '/resume  查看保存的会话',
-          '',
-          '— 快捷 —',
-          '/yolo  auto+effort max',
-          '/fast  effort low',
-          '/reset  重置所有设置',
-          `/use [名字]  切工具/列出可用 (${tools.map((tool) => tool.name).join(' ') || '无'})`,
-          ...(shortcuts ? [`${shortcuts}  快捷切换`] : []),
-          '',
-          '— 发消息 —',
-          '@<工具名>  单次指定工具',
-          '>>  接力(传上条结果)',
-          '@tool1>tool2  链式调用',
-        ].join('\n'));
+      case 'help': case 'h':
+        await reply(this.helpText(uid));
         return true;
-      }
 
-      case 'status': case 'st': {
-        const def = settings.defaultTool || this.config.defaultTool;
-        const currentMsgMode = this.normalizeMsgMode(settings.msgMode);
-        const defaultMsgMode = this.getDefaultMsgMode();
-        const sids = Object.entries(settings.sessionIds).map(([k, v]) => `${k}:${String(v).substring(0, 8)}`).join(' ') || '无';
-        const lines = [
-          `工具: ${def}${this.registry.get(def)?.displayName ? ` (${this.registry.get(def)!.displayName})` : ''}`,
-          `模式: ${settings.mode}`,
-          `effort: ${settings.effort}`,
-          `model: ${settings.model || '默认'}`,
-          `turns: ${settings.maxTurns}`,
-          `budget: ${settings.maxBudget > 0 ? '$' + settings.maxBudget : '无限'}`,
-          `sandbox: ${settings.sandbox || '无'}`,
-          `search: ${settings.search ? 'ON' : 'OFF'}`,
-          `msgMode: ${currentMsgMode} (默认: ${defaultMsgMode})`,
-          `thoughts: ${settings.showThoughts ? 'ON' : 'OFF'}`,
-          `cliVerbose: ${settings.verbose ? 'ON' : 'OFF'} (Kimi)`,
-          `system: ${settings.systemPrompt ? settings.systemPrompt.substring(0, 40) + '...' : '无'}`,
-          `dir: ${settings.workDir || this.config.workDir}`,
-          `会话: ${sids}`,
-          `可用: ${this.availableToolList()}`,
-        ];
-        const getDeliveryStatus = (this.ilink as ILinkClient & {
-          getDeliveryStatus?: (userId: string) => {
-            quota: { sentItems: number; remainingItems: number; maxItemsPerWindow: number; rateBackoffUntil: number };
-            pending: unknown[];
-            failed: unknown[];
-          };
-        }).getDeliveryStatus;
-        if (getDeliveryStatus) {
-          const delivery = getDeliveryStatus.call(this.ilink, uid);
-          const backoff = delivery.quota.rateBackoffUntil > Date.now() ? 'backoff' : 'ready';
-          lines.push(`delivery: pending=${delivery.pending.length} failed=${delivery.failed.length} sent=${delivery.quota.sentItems}/${delivery.quota.maxItemsPerWindow} remaining=${delivery.quota.remainingItems} ${backoff}`);
-        }
-        const openTasks = this.tasks.list({ userId: uid, phases: ['delivery-pending', 'recovery-required'] });
-        if (openTasks.length > 0) {
-          const count = (phase: string) => openTasks.filter((task) => task.phase === phase).length;
-          lines.push(`tasks: delivery-pending=${count('delivery-pending')} recovery-required=${count('recovery-required')} (/tasks)`);
-        }
-        await reply(lines.join('\n'));
+      case 'status': case 'st':
+        await reply(this.statusText(uid));
         return true;
-      }
+
+      case 'set':
+        await reply(this.applySet(uid, arg));
+        return true;
 
       case 'models': {
         try {
@@ -1122,10 +1290,11 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
         return true;
       }
 
-      case 'new': case 'n':
+      case 'new': case 'n': case 'clear': case 'compact': case 'compress': case 'summarize':
         this.sessions.clearSession(uid);
         this.clearSessionGrants(uid);
-        await reply('新会话');
+        if (cmd === 'clear') this.lastResponse.delete(uid);
+        await reply(cmd === 'clear' ? '已清除所有会话和接力内容' : '新会话');
         return true;
 
       case 'cancel': case 'c': {
@@ -1162,7 +1331,7 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
         return true;
       }
 
-      case 'model': case 'm':
+      case 'model': case 'm': {
         const model = this.normalizeModelArg(arg);
         if (!model) {
           this.sessions.update(uid, { model: '' });
@@ -1172,18 +1341,24 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
           await reply(`model → ${model}`);
         }
         return true;
+      }
 
       case 'mode': {
-        const modes: Record<string, string> = { auto: 'auto', safe: 'safe', plan: 'plan' };
-        const v = modes[arg.toLowerCase()];
-        if (!v) { await reply('/mode <auto|safe|plan>\nauto=最高权限 safe=每次敏感操作在微信里问你 plan=只读'); return true; }
-        this.sessions.update(uid, { mode: v as any });
-        const desc: Record<string, string> = {
-          auto: 'AUTO\nClaude: --dangerously-skip-permissions\nCodex: --yolo\nGemini: --approval-mode yolo\nKimi: -p (自带auto)',
-          safe: 'SAFE = 每次敏感操作在微信里问你\n回 1 允许一次 / 2 本会话自动允许同类（同一程序的命令或同类操作，提示里写明范围） / 3 拒绝，5 分钟无回复自动拒绝\n(需工具支持审批；Codex: 在 workspace-write 沙箱内执行；Kimi: /mode 无效)',
-          plan: 'PLAN\nClaude: --permission-mode plan\nCodex: --sandbox read-only\nGemini: --approval-mode plan\nKimi: -p 不支持plan (恒auto)',
-        };
-        await reply(desc[v]);
+        const tool = this.currentTool(uid);
+        const supported = this.toolCapabilities(tool).modes;
+        const v = (['auto', 'safe', 'plan'] as const).find((mode) => mode === arg.toLowerCase());
+        if (!v) {
+          await reply(`当前: ${settings.mode}\n/mode <auto|safe|plan>\nauto=最高权限 safe=每次敏感操作在微信里问你 plan=只读`);
+          return true;
+        }
+        this.sessions.update(uid, { mode: v });
+        const note = MODE_NOTES[tool]?.[v];
+        const lines = [MODE_MEANING[v]];
+        if (note) lines.push(`${tool}: ${note}`);
+        if (supported && !supported.includes(v)) lines.push(`(${tool} 不支持 ${v} 模式)`);
+        if (tool === 'gemini' && settings.approvalMode) lines.push(`(已用 /set approval ${settings.approvalMode} 覆盖；/set approval off 恢复跟随 /mode)`);
+        if (tool === 'codex' && settings.sandbox) lines.push(`(已用 /set sandbox ${settings.sandbox} 覆盖；/set sandbox off 恢复跟随 /mode)`);
+        await reply(lines.join('\n'));
         return true;
       }
 
@@ -1193,20 +1368,6 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
         this.clearSessionGrants(uid);
         await reply(`dir → ${arg}`);
         return true;
-
-      case 'system': case 'sys':
-        if (!arg || arg === 'clear' || arg === 'reset') {
-          this.sessions.update(uid, { systemPrompt: '' });
-          await reply('system prompt → 清除');
-        } else {
-          this.sessions.update(uid, { systemPrompt: arg });
-          await reply(`system prompt → ${arg.substring(0, 60)}...`);
-        }
-        return true;
-
-      // ═══════════════════════════════════════════
-      // Claude Code
-      // ═══════════════════════════════════════════
 
       case 'effort': case 'e': {
         const map: Record<string, string> = {
@@ -1221,222 +1382,6 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
         return true;
       }
 
-      case 'turns': case 't': {
-        const n = parseInt(arg);
-        if (!n || n < 1) { await reply(`当前: ${settings.maxTurns}\n/turns <数字>`); return true; }
-        this.sessions.update(uid, { maxTurns: n });
-        await reply(`turns → ${n}`);
-        return true;
-      }
-
-      case 'budget': case 'b':
-        if (!arg || arg === 'off' || arg === '0') {
-          this.sessions.update(uid, { maxBudget: 0 });
-          await reply('budget → 无限');
-        } else {
-          const v = parseFloat(arg);
-          if (isNaN(v)) { await reply('/budget <美元> 或 /budget off'); return true; }
-          this.sessions.update(uid, { maxBudget: v });
-          await reply(`budget → $${v}`);
-        }
-        return true;
-
-      case 'tools':
-        if (!arg || arg === 'reset') {
-          this.sessions.update(uid, { allowedTools: '' });
-          await reply('allowedTools → 全部');
-        } else {
-          this.sessions.update(uid, { allowedTools: arg });
-          await reply(`allowedTools → ${arg}`);
-        }
-        return true;
-
-      case 'notool':
-        if (!arg || arg === 'reset') {
-          this.sessions.update(uid, { disallowedTools: '' });
-          await reply('disallowedTools → 无');
-        } else {
-          this.sessions.update(uid, { disallowedTools: arg });
-          await reply(`disallowedTools → ${arg}`);
-        }
-        return true;
-
-      case 'verbose': case 'v': {
-        // Capture the new value first: update() mutates the live `settings` object,
-        // so reading settings.verbose after update() would report the opposite state.
-        const v = !settings.verbose;
-        this.sessions.update(uid, { verbose: v });
-        await reply(`verbose(Kimi CLI) → ${v ? 'ON' : 'OFF'}`);
-        return true;
-      }
-
-      // ═══════════════════════════════════════════
-      // Codex
-      // ═══════════════════════════════════════════
-
-      case 'sandbox': case 'sb': {
-        const aliases: Record<string, string> = {
-          ro: 'read-only', 'read-only': 'read-only', readonly: 'read-only',
-          ws: 'workspace-write', 'workspace-write': 'workspace-write', write: 'workspace-write',
-          full: 'danger-full-access', 'danger-full-access': 'danger-full-access', danger: 'danger-full-access',
-          off: '', reset: '',
-        };
-        const v = aliases[arg.toLowerCase()];
-        if (v === undefined) { await reply(`当前: ${settings.sandbox || '无'}\n/sandbox <read-only|write|full|off>`); return true; }
-        this.sessions.update(uid, { sandbox: v });
-        await reply(v ? `sandbox → ${v}` : 'sandbox → OFF (yolo)');
-        return true;
-      }
-
-      case 'search': {
-        const v = !settings.search;
-        this.sessions.update(uid, { search: v });
-        await reply(`search → ${v ? 'ON' : 'OFF'}`);
-        return true;
-      }
-
-      case 'ephemeral': {
-        const v = !settings.ephemeral;
-        this.sessions.update(uid, { ephemeral: v });
-        await reply(`ephemeral → ${v ? 'ON' : 'OFF'}`);
-        return true;
-      }
-
-      case 'profile':
-        if (!arg) { await reply(`当前: ${settings.profile || '无'}\n/profile <名称> 或 /profile reset`); return true; }
-        this.sessions.update(uid, { profile: arg === 'reset' ? '' : arg });
-        await reply(arg === 'reset' ? 'profile → 默认' : `profile → ${arg}`);
-        return true;
-
-      // ═══════════════════════════════════════════
-      // Kimi Code
-      // ═══════════════════════════════════════════
-
-      case 'thinking': {
-        const v = !settings.thinking;
-        this.sessions.update(uid, { thinking: v });
-        await reply(`thinking → ${v ? 'ON (深度思考)' : 'OFF'}`);
-        return true;
-      }
-
-      case 'thoughts': {
-        const newValue = !settings.showThoughts;
-        this.sessions.update(uid, { showThoughts: newValue });
-        await reply(`thoughts → ${newValue ? '已开启 (将显示AI思考)' : '已关闭'}`);
-        return true;
-      }
-
-      case 'msgmode': {
-        const defaultMode = this.getDefaultMsgMode();
-        const currentMode = this.normalizeMsgMode(settings.msgMode);
-        const highRiskNow = currentMode === 'verbose' && !!settings.showThoughts;
-        const warning = '⚠️ 警告: 高频交互任务（如浏览器操作）不建议同时开启 /thoughts + /msgmode verbose，可能触发 iLink 限流，通常约 2-3 分钟恢复。';
-        const modes: Record<string, MsgMode> = {
-          verbose: 'verbose',
-          detailed: 'verbose',
-          normal: 'normal',
-          compact: 'compact',
-          simple: 'compact',
-        };
-        if (!arg) {
-          await reply([
-            `当前: ${currentMode}`,
-            `默认: ${defaultMode}`,
-            '/msgmode <verbose|normal|compact|default>',
-            '',
-            'verbose - 流式显示文本 + Activity(含摘要)',
-            'normal  - 流式显示文本，Activity仅在最终结果展示',
-            'compact - 仅显示最终结果',
-            '',
-            '(思考内容由 /thoughts 控制)',
-            '',
-            warning,
-            `当前风险: ${highRiskNow ? '高' : '正常'}`,
-          ].join('\n'));
-          return true;
-        }
-
-        const lower = arg.toLowerCase();
-        if (lower === 'default' || lower === 'reset') {
-          this.sessions.update(uid, { msgMode: defaultMode });
-          const risk = defaultMode === 'verbose' && !!settings.showThoughts ? '高' : '正常';
-          await reply(`msgmode: ${currentMode} → ${defaultMode}\n当前: ${defaultMode} | 默认: ${defaultMode}\n当前风险: ${risk}\n\n${warning}`);
-          return true;
-        }
-
-        const v = modes[lower];
-        if (!v) {
-          await reply(`无效 msgmode: ${arg}\n当前: ${currentMode}\n默认: ${defaultMode}\n/msgmode <verbose|normal|compact|default>`);
-          return true;
-        }
-
-        this.sessions.update(uid, { msgMode: v });
-        const desc: Record<MsgMode, string> = {
-          verbose: '流式显示文本 + Activity(含摘要)',
-          normal: '流式显示文本，Activity仅在最终结果展示',
-          compact: '仅显示最终结果',
-        };
-        const highRisk = v === 'verbose' && !!settings.showThoughts;
-        await reply([
-          `msgmode: ${currentMode} → ${v}`,
-          `当前: ${v} | 默认: ${defaultMode}`,
-          `当前风险: ${highRisk ? '高' : '正常'}`,
-          '',
-          desc[v],
-          '',
-          '(思考内容由 /thoughts 控制)',
-          ...(highRisk ? ['', warning] : []),
-        ].join('\n'));
-        return true;
-      }
-
-      // ═══════════════════════════════════════════
-      // Gemini
-      // ═══════════════════════════════════════════
-
-      case 'approval': {
-        const modes: Record<string, string> = { default: 'default', auto_edit: 'auto_edit', yolo: 'yolo', plan: 'plan' };
-        const v = modes[arg.toLowerCase()];
-        if (!v) { await reply(`当前: ${settings.approvalMode || 'yolo'}\n/approval <default|auto_edit|yolo|plan>`); return true; }
-        this.sessions.update(uid, { approvalMode: v });
-        await reply(`approval-mode → ${v}`);
-        return true;
-      }
-
-      case 'include': case 'inc':
-        if (!arg || arg === 'reset') {
-          this.sessions.update(uid, { includeDirs: '' });
-          await reply('include dirs → 清除');
-        } else {
-          this.sessions.update(uid, { includeDirs: arg });
-          await reply(`include dirs → ${arg}`);
-        }
-        return true;
-
-      case 'ext': case 'extensions':
-        if (!arg || arg === 'reset') {
-          this.sessions.update(uid, { extensions: '' });
-          await reply('extensions → 默认');
-        } else {
-          this.sessions.update(uid, { extensions: arg });
-          await reply(`extensions → ${arg}`);
-        }
-        return true;
-
-      // ═══════════════════════════════════════════
-      // 快捷组合
-      // ═══════════════════════════════════════════
-
-      case 'yolo':
-        this.sessions.update(uid, { mode: 'auto', effort: 'max' } as any);
-        await reply('YOLO: mode=auto + effort=max');
-        return true;
-
-      case 'fast':
-        this.sessions.update(uid, { effort: 'low' });
-        await reply('effort → low (快速模式)');
-        return true;
-
       case 'reset':
         this.sessions.update(uid, {
           mode: 'auto', effort: 'high', model: '', maxTurns: 100, maxBudget: 0,
@@ -1449,79 +1394,18 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
         await reply('所有设置已重置');
         return true;
 
-      // ═══════════════════════════════════════════
-      // Claude 额外
-      // ═══════════════════════════════════════════
+      // ── 操作类 (转化为 prompt 发给当前工具) ──
 
-      case 'bare': {
-        const v = !settings.bare;
-        this.sessions.update(uid, { bare: v } as any);
-        await reply(`bare → ${v ? 'ON (跳过配置加载)' : 'OFF'}`);
-        return true;
-      }
-
-      case 'adddir': case 'add-dir':
-        if (!arg) { await reply(`当前: ${(settings as any).addDir || '无'}\n/adddir <路径>`); return true; }
-        this.sessions.update(uid, { addDir: arg } as any);
-        await reply(`add-dir → ${arg}`);
-        return true;
-
-      case 'name':
-        if (!arg) { await reply(`当前: ${(settings as any).sessionName || '无'}\n/name <名称>`); return true; }
-        this.sessions.update(uid, { sessionName: arg } as any);
-        await reply(`session name → ${arg}`);
-        return true;
-
-      // ═══════════════════════════════════════════
-      // 操作类 (转化为 prompt 发给当前工具)
-      // ═══════════════════════════════════════════
-
-      case 'compact': case 'compress': case 'summarize': {
-        // Clear session + start fresh with summary instruction
-        this.sessions.clearSession(uid);
-        this.clearSessionGrants(uid);
-        await reply('会话已压缩 (新session, 旧上下文已清除)');
-        return true;
-      }
-
-      case 'diff': {
-        const tool = settings.defaultTool || this.config.defaultTool;
+      case 'diff': case 'commit': case 'review': {
+        const prompts: Record<string, string> = {
+          diff: 'Show the current git diff of uncommitted changes. Be concise.',
+          commit: 'Create a git commit for all staged changes with an appropriate commit message.',
+          review: 'Review the current code changes (git diff) and provide feedback on quality, bugs, and improvements.',
+        };
+        const tool = this.currentTool(uid);
         if (this.registry.isAvailable(tool)) {
-          await this.exec(uid, tool, arg || 'Show the current git diff of uncommitted changes. Be concise.', undefined, taskGeneration, run);
+          await this.exec(uid, tool, arg || prompts[cmd], undefined, taskGeneration, run);
         }
-        return true;
-      }
-
-      case 'commit': {
-        const tool = settings.defaultTool || this.config.defaultTool;
-        if (this.registry.isAvailable(tool)) {
-          await this.exec(uid, tool, arg || 'Create a git commit for all staged changes with an appropriate commit message.', undefined, taskGeneration, run);
-        }
-        return true;
-      }
-
-      case 'review': {
-        const tool = settings.defaultTool || this.config.defaultTool;
-        if (this.registry.isAvailable(tool)) {
-          await this.exec(uid, tool, arg || 'Review the current code changes (git diff) and provide feedback on quality, bugs, and improvements.', undefined, taskGeneration, run);
-        }
-        return true;
-      }
-
-      case 'init': {
-        const tool = settings.defaultTool || this.config.defaultTool;
-        const file = tool === 'codex' ? 'AGENTS.md' : tool === 'gemini' ? 'GEMINI.md' : 'CLAUDE.md';
-        if (this.registry.isAvailable(tool)) {
-          await this.exec(uid, tool, arg || `Analyze this project and create a ${file} configuration file with appropriate instructions.`, undefined, taskGeneration, run);
-        }
-        return true;
-      }
-
-      case 'fork': case 'branch': {
-        // Fork = clear session ID so next call doesn't --resume
-        const tool = settings.defaultTool || this.config.defaultTool;
-        this.sessions.clearSession(uid, tool);
-        await reply(`已 fork ${tool} 会话 (下次消息开始新分支)`);
         return true;
       }
 
@@ -1535,14 +1419,6 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
         return true;
       }
 
-      case 'files': {
-        const tool = settings.defaultTool || this.config.defaultTool;
-        if (this.registry.isAvailable(tool)) {
-          await this.exec(uid, tool, 'List all files in the current working directory. Show the tree structure concisely.', undefined, taskGeneration, run);
-        }
-        return true;
-      }
-
       case 'send': {
         if (!arg) {
           await reply('/send <文件路径>\n发送本地文件到微信');
@@ -1550,7 +1426,6 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
         }
         try {
           const filePath = arg.trim();
-          const { existsSync } = await import('node:fs');
           if (!existsSync(filePath)) {
             await reply(`文件不存在: ${filePath}`);
             return true;
@@ -1572,74 +1447,30 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
         return true;
       }
 
-      case 'plan': {
-        if (arg) {
-          // /plan <description> → send plan request to tool
-          const tool = settings.defaultTool || this.config.defaultTool;
-          if (this.registry.isAvailable(tool)) {
-            await this.exec(uid, tool, `Create a detailed plan for: ${arg}. Only plan, do not execute.`, undefined, taskGeneration, run);
-          }
-        } else {
-          // /plan with no args → switch to plan mode
-          this.sessions.update(uid, { mode: 'plan' } as any);
-          await reply('PLAN mode ON');
-        }
-        return true;
-      }
-
-      case 'continue': {
-        // Alias for /resume
-        const sids = Object.entries(settings.sessionIds);
-        if (sids.length === 0) {
-          await reply('无活跃会话，用 /resume 浏览历史');
-        } else {
-          const lines = sids.map(([k, v]) => `${k}: ${String(v).substring(0, 12)}...`);
-          await reply(`活跃会话:\n${lines.join('\n')}\n\n/resume 浏览所有历史`);
-        }
-        return true;
-      }
-
-      case 'clear': {
-        this.sessions.clearSession(uid);
-        this.clearSessionGrants(uid);
-        this.lastResponse.delete(uid);
-        await reply('已清除所有会话和历史');
-        return true;
-      }
-
-      case 'session': {
-        const tool = settings.defaultTool || this.config.defaultTool;
-        if (arg.startsWith('set ')) {
-          const id = arg.substring(4).trim();
-          this.sessions.setSession(uid, tool, id);
-          await reply(`${tool} session → ${id}\n下条消息将 --resume 此会话`);
-        } else {
-          const sids = Object.entries(settings.sessionIds);
-          const lines = sids.length > 0
-            ? sids.map(([k, v]) => `${k}: ${v}`).join('\n')
-            : '(无活跃会话)';
-          await reply(`活跃会话:\n${lines}\n\n/session set <id> 手动设置\n/resume 浏览所有历史会话`);
-        }
-        return true;
-      }
-
       case 'resume': case 'sessions': {
-        const tool = settings.defaultTool || this.config.defaultTool;
+        const tool = this.currentTool(uid);
         if (arg) {
-          // Another session: its "本会话自动允许" grants don't carry over.
-          this.clearSessionGrants(uid);
-          // /resume <number> → pick from list, or /resume <uuid> → direct set
+          // /resume <number> → pick from this user's last list for this tool, or /resume <id> → direct set.
+          // Switching to another session drops its "本会话自动允许" grants.
           const num = parseInt(arg);
-          if (!isNaN(num) && this._lastSessionList) {
-            const pick = this._lastSessionList[num - 1];
+          if (!isNaN(num) && String(num) === arg.trim()) {
+            const listed = this.lastSessionLists.get(`${uid}:${tool}`);
+            const workDir = settings.workDir || this.config.workDir;
+            if (!listed || listed.workDir !== workDir) {
+              await reply(`没有可选的 ${tool} 会话列表，先发 /resume 查看`);
+              return true;
+            }
+            const pick = listed.items[num - 1];
             if (pick) {
+              this.clearSessionGrants(uid);
               this.sessions.setSession(uid, tool, pick.id);
               await reply(`已恢复 ${tool} 会话:\n${pick.summary}\n\nID: ${pick.id}`);
             } else {
-              await reply(`无效编号，范围 1-${this._lastSessionList.length}`);
+              await reply(`无效编号，范围 1-${listed.items.length}`);
             }
           } else {
-            // Treat as UUID
+            // Treat as a session id
+            this.clearSessionGrants(uid);
             this.sessions.setSession(uid, tool, arg.trim());
             await reply(`${tool} session → ${arg.trim()}`);
           }
@@ -1651,7 +1482,7 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
           await reply(`${tool} 没有历史会话`);
           return true;
         }
-        this._lastSessionList = list;
+        this.lastSessionLists.set(`${uid}:${tool}`, { workDir: settings.workDir || this.config.workDir, items: list });
         const lines = list.map((s, i) =>
           `${i + 1}. ${s.date} ${s.summary}\n   ${s.id}`
         );
@@ -1659,9 +1490,7 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
         return true;
       }
 
-      // ═══════════════════════════════════════════
-      // 不适用于微信的命令 (给出说明)
-      // ═══════════════════════════════════════════
+      // ── 不适用于微信的命令 (给出说明) ──
 
       case 'vim': case 'theme': case 'color': case 'terminal-setup':
       case 'keybindings': case 'chrome': case 'ide': case 'stickers':
@@ -1678,13 +1507,11 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
         await reply(`/${cmd} 仅在本地终端可用，不适用于微信`);
         return true;
 
-      // ═══════════════════════════════════════════
-      // 工具切换
-      // ═══════════════════════════════════════════
+      // ── 工具切换 ──
 
       case 'use': case 'u': {
         if (arg) { await this.switchTool(uid, arg); return true; }
-        const current = settings.defaultTool || this.config.defaultTool;
+        const current = this.currentTool(uid);
         const tools = this.availableTools();
         if (tools.length === 0) { await reply('本机没有检测到可用的 CLI 工具'); return true; }
         const lines = tools.map((tool) =>
@@ -1696,10 +1523,6 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
       case 'kimi': case 'km': case 'opencode': case 'oc':
         await this.switchTool(uid, cmd);
         return true;
-
-      // ═══════════════════════════════════════════
-      // 未识别
-      // ═══════════════════════════════════════════
 
       default:
         await reply(`未知命令: /${cmd}\n/help 查看所有命令`);
@@ -1782,13 +1605,17 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
             const dayDir = join(baseDir, year, month, day);
             const files = readdirSync(dayDir).filter(f => f.endsWith('.jsonl'));
             for (const f of files) {
+              // rollout-<YYYY-MM-DDTHH-MM-SS>-<thread id>.jsonl: store the real thread id, which
+              // `codex exec resume <id>` takes. The old 'last' sentinel resumed whatever ran last in
+              // the cwd, crossing users that share a workDir.
+              const m = f.match(/^rollout-\d{4}-\d{2}-\d{2}T(\d{2})-(\d{2})-\d{2}-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$/i);
+              if (!m) continue;
               try {
                 const stat = statSync(join(dayDir, f));
-                const id = f.replace('.jsonl', '').replace('rollout-', '').substring(0, 40);
                 results.push({
-                  id: 'last', // codex uses --last for resume
-                  date: `${year}-${month}-${day}`,
-                  summary: f.replace('.jsonl', '').substring(0, 50),
+                  id: m[3],
+                  date: `${year}-${month}-${day} ${m[1]}:${m[2]}`,
+                  summary: `codex 会话 ${m[3].substring(0, 8)}`,
                   mtime: stat.mtime.getTime(),
                 });
               } catch { continue; }
@@ -1939,6 +1766,7 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
     }
     const settings = this.sessions.get(uid);
     const hadSession = adapter.capabilities.sessionResume && !!settings.sessionIds[toolName];
+    const storedSession = settings.sessionIds[toolName];
 
     if (signal.aborted) return { result: { text: '已取消', error: true }, notice: '' };
 
@@ -1958,6 +1786,12 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
       log.warn(`[${toolName}] 会话已过期，已清除旧会话`);
       this.sessions.clearSession(uid, toolName);
       return { result, notice: '[会话已过期并自动清除，如需重试请重新发送]\n\n' };
+    }
+    // An old sentinel ('last' / 'continue') is not resumable; adapters that store real ids start a
+    // fresh session and hand back its id. Say so once — the real id replaces the sentinel.
+    const sentinel = LEGACY_SESSION_SENTINELS[toolName];
+    if (sentinel && storedSession === sentinel && result.sessionId && result.sessionId !== sentinel && !signal.aborted) {
+      return { result, notice: '[旧版会话标记已失效，已开新会话]\n\n' };
     }
     return { result, notice: '' };
   }

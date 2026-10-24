@@ -573,12 +573,12 @@ test('exec maps stale default-alias model to empty before adapter execution', as
 // Bug: update() mutates the live settings ref, so reading settings.<flag> after update()
 // reported the inverted state. These assert the reply text matches what was actually stored.
 
+// The old one-word toggles now forward to /set (0.2.0); bare /set <key> still toggles.
 for (const { cmd, field, on } of [
-  { cmd: 'verbose', field: 'verbose', on: 'ON' },
   { cmd: 'search', field: 'search', on: 'ON' },
   { cmd: 'ephemeral', field: 'ephemeral', on: 'ON' },
-  { cmd: 'thinking', field: 'thinking', on: 'ON (深度思考)' },
-  { cmd: 'bare', field: 'bare', on: 'ON (跳过配置加载)' },
+  { cmd: 'bare', field: 'bare', on: 'ON' },
+  { cmd: 'set thoughts', field: 'showThoughts', on: 'ON' },
 ]) {
   test(`/${cmd} toggle reports the value it actually stored (on then off)`, async () => {
     const { router, sessions, messages } = createRouter();
