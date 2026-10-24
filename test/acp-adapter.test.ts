@@ -214,6 +214,39 @@ test('permission: hook returning null rejects', async () => {
   assert.deepEqual(permissionAnswer(run), { outcome: 'selected', optionId: 'no-once' });
 });
 
+test('permission: overlapping approvals keep the idle clock off until the last one is answered', async () => {
+  const req = (id: string, title: string) => ({ toolCall: { toolCallId: id, title, kind: 'execute' }, options: PERMISSION_OPTIONS });
+  const run = setup({ prompt: [{ permissions: [req('c1', 'Run `ls`'), req('c2', 'Run `rm x`')] }, msg('both answered')] });
+  let n = 0;
+  const result = await run.adapter.execute('q', {
+    settings: settings(run.workDir, { mode: 'safe' }),
+    timeout: 400,
+    // The first answer comes quickly; the second only after well over `timeout` more. The first
+    // one's cleanup used to re-arm the idle timer and kill the agent mid-approval.
+    requestPermission: () => new Promise((resolve) => setTimeout(() => resolve('yes-once'), n++ === 0 ? 50 : 1_200)),
+  });
+  assert.equal(result.error, undefined, result.text);
+  assert.equal(result.text, 'both answered');
+});
+
+const MODES = { currentModeId: 'default', availableModes: [{ id: 'default', name: 'Default' }, { id: 'plan', name: 'Plan' }, { id: 'yolo', name: 'YOLO' }] };
+const MODE_IDS = { auto: 'yolo', safe: 'default', plan: 'plan' };
+
+test('set_mode failure in plan rejects the round with a readable error instead of prompting', async () => {
+  const run = setup({ modes: MODES, setModeError: { code: -32603, message: 'mode switch broke' }, prompt: [msg('should not run')] }, { modeIds: MODE_IDS });
+  const result = await run.adapter.execute('q', { settings: settings(run.workDir, { mode: 'plan' }) });
+  assert.equal(result.error, true);
+  assert.match(result.text, /^Fake ACP 无法切换到 plan 模式（plan）：.*mode switch broke[\s\S]*为安全起见本轮未执行/);
+  assert.equal(result.sessionId, 'sess-new-1');
+  assert.equal(run.log().some((m) => m.method === 'session/prompt'), false, 'the prompt never ran');
+});
+
+test('set_mode failure in auto is only logged: the prompt still runs', async () => {
+  const run = setup({ modes: MODES, setModeError: { code: -32603, message: 'mode switch broke' }, prompt: [msg('ran anyway')] }, { modeIds: MODE_IDS });
+  const result = await run.adapter.execute('q', { settings: settings(run.workDir, { mode: 'auto' }) });
+  assert.equal(result.text, 'ran anyway');
+});
+
 test('cancel: abort sends session/cancel; agent ends the turn with stopReason cancelled', async () => {
   const run = setup({ prompt: [msg('working'), { waitCancel: true }] });
   const ac = new AbortController();

@@ -135,6 +135,8 @@ export interface AdapterCapabilities {
   hasModel: boolean;
   hasSearch: boolean;
   hasBudget: boolean;
+  /** Calls `ExecOptions.requestPermission` in `safe` mode (approvals are asked in WeChat). */
+  approvals?: boolean;
 }
 
 export interface CLIAdapter {

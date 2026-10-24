@@ -84,6 +84,7 @@ export class AcpAdapter implements CLIAdapter {
   readonly capabilities: AdapterCapabilities = {
     streaming: true, jsonOutput: true, sessionResume: true,
     modes: ['auto', 'safe', 'plan'], hasEffort: false, hasModel: false, hasSearch: false, hasBudget: false,
+    approvals: true,
   };
 
   constructor(readonly preset: AcpPreset, private readonly spawnAgent: AcpSpawn = spawnCli) {
@@ -197,10 +198,13 @@ export class AcpAdapter implements CLIAdapter {
 
     // ── Idle timeout (reset on every inbound message; paused while waiting on the user) ──
     let idleTimer: ReturnType<typeof setTimeout> | null = null;
+    // Approvals currently waiting on the user (they can overlap): the clock stays off until the
+    // last one is answered, whatever else arrives meanwhile.
+    let waitingOnUser = 0;
     const pauseIdle = () => { if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; } };
     const resetIdle = () => {
       pauseIdle();
-      if (!opts.timeout || cancelled) return;
+      if (!opts.timeout || cancelled || waitingOnUser > 0) return;
       idleTimer = setTimeout(() => { timedOut = true; stop(); }, opts.timeout);
     };
 
@@ -231,7 +235,7 @@ export class AcpAdapter implements CLIAdapter {
       if (settings.mode === 'auto') return select(pick('allow_once', 'allow_always'));
       if (settings.mode === 'plan') return select(pick('reject_once', 'reject_always'));
 
-      // safe: delegate to the host's approval hook when wired (WeChat approvals land in a later PR).
+      // safe: delegate to the host's approval hook when wired (the bridge asks the user in WeChat).
       if (opts.requestPermission) {
         const tool = params?.toolCall ?? {};
         const req: PermissionRequest = {
@@ -239,6 +243,7 @@ export class AcpAdapter implements CLIAdapter {
           kind: tool.kind || undefined,
           options: options.map((o) => ({ id: o.optionId, name: o.name, kind: o.kind })),
         };
+        waitingOnUser++;
         pauseIdle();
         try {
           const chosen = await Promise.race([opts.requestPermission(req, signal), untilAborted()]);
@@ -249,6 +254,7 @@ export class AcpAdapter implements CLIAdapter {
           log.warn(`[${this.name}] permission hook failed, rejecting:`, (e as Error).message);
           return select(pick('reject_once', 'reject_always'));
         } finally {
+          waitingOnUser--;
           resetIdle();
         }
       }
@@ -321,6 +327,11 @@ export class AcpAdapter implements CLIAdapter {
           await client.request('session/set_mode', { sessionId, modeId: wantMode }, HANDSHAKE_TIMEOUT_MS);
         } catch (e) {
           if (client.closed) throw e;
+          // In safe/plan the mode is the safety boundary: running the prompt in whatever mode the
+          // agent defaulted to could execute what the user asked to be reviewed or only planned.
+          if (settings.mode !== 'auto') {
+            return await fail(`${this.displayName} 无法切换到 ${settings.mode} 模式（${wantMode}）：${(e as Error).message}\n为安全起见本轮未执行；可重试，或用 /mode auto`, { sessionId });
+          }
           log.warn(`[${this.name}] session/set_mode ${wantMode} failed:`, (e as Error).message);
         }
       }

@@ -19,6 +19,12 @@ class FakeClaude {
   readonly written: any[] = [];
   stdinEnded = false;
   killedWith?: string;
+  /** Every signal sent, in order. */
+  readonly signals: string[] = [];
+  /** Keep running after stdin closes (a CLI slow to exit after its result). */
+  holdExit = false;
+  /** Survive SIGTERM (a wedged CLI): only SIGKILL ends it. */
+  ignoreSigterm = false;
   private readonly stdout = new PassThrough();
   private readonly stderr = new PassThrough();
   private waiters: Array<{ pred: (m: any) => boolean; resolve: (m: any) => void }> = [];
@@ -42,11 +48,17 @@ class FakeClaude {
       }
     });
     // Like the real CLI: closing stdin after the result lets the process exit.
-    stdin.on('end', () => { this.stdinEnded = true; this.exit(0); });
+    stdin.on('end', () => { this.stdinEnded = true; if (!this.holdExit) this.exit(0); });
     Object.assign(child, {
       // No pid: on Windows killProc would shell out to `taskkill` for a fake pid and never exit.
-      stdin, stdout: this.stdout, stderr: this.stderr, killed: false, exitCode: null, pid: undefined,
-      kill: (sig: string) => { this.killedWith = sig; Object.assign(child, { killed: true }); this.exit(null, sig); return true; },
+      stdin, stdout: this.stdout, stderr: this.stderr, killed: false, exitCode: null, signalCode: null, pid: undefined,
+      kill: (sig: string) => {
+        this.killedWith = sig;
+        this.signals.push(sig);
+        Object.assign(child, { killed: true });
+        if (!(sig === 'SIGTERM' && this.ignoreSigterm)) this.exit(null, sig);
+        return true;
+      },
     });
     this.child = child;
   }
@@ -429,6 +441,78 @@ test('a CLI that ignores the interrupt is killed after the grace period', async 
   assert.equal(fake.calls[0].proc.killedWith, 'SIGTERM');
   assert.equal(result.text, '已取消');
   assert.equal(result.sessionId, SID);
+});
+
+test('a CLI that survives SIGTERM is SIGKILLed one grace period later', async () => {
+  const ac = new AbortController();
+  const fake = fakeSpawn(async (p) => {
+    p.ignoreSigterm = true;
+    await p.userMessage();
+    p.emit(init);
+    setTimeout(() => ac.abort(), 5);
+  });
+  const result = await new ClaudeAdapter(fake.spawn, 20).execute('hi', { settings: settings(), signal: ac.signal });
+  assert.deepEqual(fake.calls[0].proc.signals, ['SIGTERM', 'SIGKILL']);
+  assert.equal(result.text, '已取消');
+});
+
+test('an exiting CLI is not SIGKILLed after SIGTERM', async () => {
+  const ac = new AbortController();
+  const fake = fakeSpawn(async (p) => { await p.userMessage(); p.emit(init); setTimeout(() => ac.abort(), 5); });
+  await new ClaudeAdapter(fake.spawn, 20).execute('hi', { settings: settings(), signal: ac.signal });
+  await new Promise((r) => setTimeout(r, 50));
+  assert.deepEqual(fake.calls[0].proc.signals, ['SIGTERM']);
+});
+
+test('a pending approval keeps the idle clock off even while keep_alive lines arrive', async () => {
+  const fake = fakeSpawn(async (p) => {
+    await p.userMessage();
+    p.emit(init);
+    p.emit(canUseTool('p1', 'Bash', { command: 'npm test' }));
+    // The CLI keeps the stream alive while it waits; each line used to re-arm the idle timer,
+    // which then fired in the silence before the user answered.
+    for (let i = 0; i < 4; i++) {
+      await new Promise((r) => setTimeout(r, 10));
+      p.emit({ type: 'keep_alive' });
+    }
+    await p.next(responseTo('p1'));
+    assert.equal(p.written.some((m) => m.request?.subtype === 'interrupt'), false, 'no interrupt while the user decides');
+    p.emit(success('ok'));
+  });
+  const result = await new ClaudeAdapter(fake.spawn).execute('hi', {
+    settings: settings({ mode: 'safe' }),
+    timeout: 30,
+    // The user answers well after the keep_alives stop (> timeout of silence).
+    requestPermission: () => new Promise((resolve) => setTimeout(() => resolve('allow_once'), 150)),
+  });
+  assert.equal(result.error, false);
+  assert.equal(result.text, 'ok');
+});
+
+test('a result that arrived before the idle stop wins over the timeout notice', async () => {
+  const fake = fakeSpawn(async (p) => {
+    p.holdExit = true; // slow to exit after the result: the idle timer fires meanwhile
+    await p.userMessage();
+    p.emit(init);
+    p.emit(success('the answer'));
+    await p.next((m) => m.request?.subtype === 'interrupt');
+    p.exit(0);
+  });
+  const result = await new ClaudeAdapter(fake.spawn).execute('hi', { settings: settings(), timeout: 20 });
+  assert.equal(result.error, false);
+  assert.equal(result.text, 'the answer');
+});
+
+test('an error result provoked by the idle interrupt is still reported as a timeout', async () => {
+  const fake = fakeSpawn(async (p) => {
+    await p.userMessage();
+    p.emit(init);
+    await p.next((m) => m.request?.subtype === 'interrupt');
+    p.emit({ type: 'result', subtype: 'error_during_execution', is_error: true, session_id: SID, errors: [] });
+  });
+  const result = await new ClaudeAdapter(fake.spawn).execute('hi', { settings: settings(), timeout: 20 });
+  assert.equal(result.error, true);
+  assert.match(result.text, /执行超时/);
 });
 
 test('idle timeout interrupts a silent run; heartbeats keep it alive', async () => {

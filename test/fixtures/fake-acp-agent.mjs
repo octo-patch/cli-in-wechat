@@ -6,12 +6,13 @@
 // Scenario fields (all optional):
 //   protocolVersion, loadSession, image, modes        → initialize / session responses
 //   hangOn: "<method>"                                → never answer that method
-//   newError / loadError / promptError: {code,message} → answer with a JSON-RPC error
+//   newError / loadError / promptError / setModeError: {code,message} → answer with a JSON-RPC error
 //   replay: [update]          → session/update sent during session/load (before its response)
 //   replayAfter: [update]     → session/update sent right after the load response
 //   prompt: [step]            → steps run on session/prompt, in order:
 //       {update}              send session/update
 //       {permission:{toolCall,options}}  send session/request_permission and await the answer
+//       {permissions:[{toolCall,options}]} send several at once and await all answers
 //       {sleep: ms}           wait
 //       {waitCancel: true}    wait until session/cancel arrives, then end with stopReason "cancelled"
 //       {stderr: "text"}      write to stderr
@@ -43,6 +44,9 @@ async function runPrompt(id, params) {
   for (const step of scenario.prompt || []) {
     if (step.update) update(params.sessionId, step.update);
     else if (step.permission) await ask('session/request_permission', { sessionId: params.sessionId, ...step.permission });
+    else if (step.permissions) {
+      await Promise.all(step.permissions.map((p) => ask('session/request_permission', { sessionId: params.sessionId, ...p })));
+    }
     else if (step.sleep) await sleep(step.sleep);
     else if (step.stderr) process.stderr.write(step.stderr);
     else if (step.raw !== undefined) process.stdout.write(`${step.raw}\n`);
@@ -91,6 +95,7 @@ async function handle(msg) {
       for (const u of scenario.replayAfter || []) update(params.sessionId, u);
       break;
     case 'session/set_mode':
+      if (scenario.setModeError) { write({ jsonrpc: '2.0', id, error: scenario.setModeError }); break; }
       write({ jsonrpc: '2.0', id, result: {} });
       break;
     case 'session/prompt':
