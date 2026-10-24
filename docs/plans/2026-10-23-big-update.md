@@ -11,7 +11,8 @@
 用户明确要求这次更新要让项目「非常之精简好用轻量」。落到工程上就是下面这些硬约束，后面每个 PR 都按它们取舍：
 
 1. **一个 CLI 只保留一条执行路径。** 不做「SDK 加 CLI 加 JSONL」三套并存。现在 OpenCode 就有 3 个文件，以后不再出现这种情况。
-2. **不新增运行时依赖。**
+2. **不新增运行时依赖，并且要减依赖。**
+   - Claude 去掉 `@anthropic-ai/claude-agent-sdk`（用户 2026-10-24 决定）。SDK 0.3 会自带一个 268MB 的平台原生二进制，node_modules 会从 122MB 涨到 367MB，而桥接本来就要求本机已经装好 `claude`。改为直接 spawn 本机 `claude`，用双向 stream-json，审批走 `--permission-prompt-tool stdio` 的控制协议，cc-connect 也是这么做的。
    - ACP 客户端自己写一个很薄的 JSON-RPC over stdio（大约 300 行），不引入 `@agentclientprotocol/sdk`。原因是这个 SDK 的 2.0 四天前刚发布就删掉了旧 API，在 Node 20 上能不能跑也没核实。
    - Codex 自己解析 `exec --json`，不引入 `@openai/codex-sdk`。这个 SDK 本身也只是 spawn `codex exec` 再解析输出。
 3. **长尾 CLI 不写代码，只写配置。** 一个通用 ACP 适配器加少量预设，就能覆盖 30 多个 CLI。用户也可以自己在 config 里加。
@@ -67,12 +68,12 @@
 ## 2. 目标架构：三种接入方式
 
 ```
-                 ┌─ 原生适配器（只给头部 CLI）：claude(SDK) / codex(exec --json)
+                 ┌─ 原生适配器（只给头部 CLI）：claude(stream-json 双向 + stdio 控制协议) / codex(exec --json)
 CLIAdapter ──────┼─ AcpAdapter（通用）：一份代码 + 预设表 → gemini? kimi? qwen copilot cursor droid devin goose kiro qoder codebuddy mcode agy …
                  └─ StreamJsonAdapter（通用，类 Claude 格式）+ TextAdapter：给没有 ACP、或 ACP 不稳的 CLI，以及用户自定义 CLI
 ```
 
-- **原生适配器**只留给能力明显超过 ACP 包装层的 CLI：Claude 有 SDK 的 canUseTool、子代理事件和会话管理；Codex 的 ACP 只是第三方包装。
+- **原生适配器**只留给能力明显超过 ACP 包装层的 CLI：Claude 有 stdio 控制协议里的 can_use_tool、子代理事件和会话管理；Codex 的 ACP 只是第三方包装。
 - **AcpAdapter**：
   - **进程模型**：按（用户 × agent × workDir）常驻一个子进程，空闲 N 分钟后回收，崩溃了下一条消息重新拉起。为了先轻量，第一版可以先做「每条消息 spawn 一次：`initialize → session/load|new → prompt` 后退出」，常驻作为后续优化。
   - **权限**：`session/request_permission` 按模式处理——auto 直接批准，safe 走统一的「交互请求」发到微信，plan 一律拒绝。
@@ -86,16 +87,15 @@ CLIAdapter ──────┼─ AcpAdapter（通用）：一份代码 + 预�
 
 ## 3. 每个 CLI 的适配清单
 
-### Claude Code（原生，SDK）
-- [ ] 把 SDK 升级到 `^0.3.310`，确认 peer deps 能装上（zod 4、`@anthropic-ai/sdk`、MCP SDK；npm 7 以上会自动装），确认 Node 20 能用。
-- [ ] 修复「出错后回退重跑」：只有 SDK 根本起不来（import 失败、二进制缺失）时才回退到 CLI；已经收到 result 的情况绝不重跑。
-- [ ] 工具结果改用 `tool_use_id` 配对；过滤掉 `parent_tool_use_id` 不为空的消息，子代理只显示「开始/完成」一行（来自 `task_started`/`task_notification`）。
-- [ ] 补上 `disallowedTools`、`additionalDirectories`；读取 `total_cost_usd`；在 system init 消息里提前拿到 session_id，这样中途取消也不会丢会话。
-- [ ] 图片改为原生传入：prompt 改成 AsyncIterable 形式，发 base64 image block。
-- [ ] `tool_progress` 当作心跳，用来重置空闲超时，防止长时间工具调用被误判为卡死。
-- [ ] 修正 CLI 回退路径的参数（`--max-turns`，safe 模式传 `--permission-mode default`）。
-- [ ] 审批：canUseTool 里非 AskUserQuestion 的工具，在 safe 模式下走 InteractionRequest（**依赖 PR C1**）。
-- 待你决定：`/mode auto` 是继续映射到 `bypassPermissions`，还是换成 Claude 新的 `auto`（分类器自动审批，更安全，但会偶尔拒绝）？
+### Claude Code（原生，CLI 双向 stream-json，无 SDK）
+> 用户 2026-10-24 决定：去掉 Agent SDK，只保留一条执行路径。
+- [ ] 删除 `@anthropic-ai/claude-agent-sdk` 依赖，以及只为它引入的 peer deps。
+- [ ] spawn 本机 `claude -p --input-format stream-json --output-format stream-json --verbose --permission-prompt-tool stdio`。user 消息从 stdin 写入，图片用原生 image content block（base64）。控制协议（`control_request`/`control_response`，包括 initialize、can_use_tool、interrupt）以 SDK 0.3.310 包内的实现为准。
+- [ ] 一次 execute 只 spawn 一次，不设任何回退，因此不会重复执行。
+- [ ] 工具结果用 `tool_use_id` 配对；过滤掉 `parent_tool_use_id` 不为空的子代理消息，子代理只显示「开始/完成」两行。
+- [ ] 补上 `disallowedTools`、`--add-dir`、`--max-turns`；读取 `total_cost_usd` 和 usage；在 system init 消息里提前拿到 session_id；`tool_progress` 当作心跳，用来重置空闲超时；取消时先发 interrupt，再兜底 kill。
+- [ ] 模式：auto 映射到 `--permission-mode auto`（分类器自动审批，用户已选定；本机 CLI 不支持时降级到 bypass，并提示一次），safe 映射到 default，plan 映射到 plan（不能写文件）。
+- [ ] can_use_tool：AskUserQuestion 走 askUser。其他工具在 C1 之前先拒绝并给出提示；C1 之后走 InteractionRequest，提供允许一次、本会话总是允许（用协议里的 permission suggestions）、拒绝三个选项。
 
 ### Codex CLI（原生，exec --json）
 - [ ] 改用 `codex exec --json`，自己解析 JSONL（类型照抄 SDK 的 `index.d.ts`）。
@@ -166,7 +166,7 @@ CLIAdapter ──────┼─ AcpAdapter（通用）：一份代码 + 预�
 | **A2 gemini** | 信任环境变量；stream-json；`--session-id`；审批模式映射；报错文案 | 无 |
 | **A3 kimi** | stream-json；`-S <id>`；不再拿 stderr 当答案 | 无 |
 | **A4 opencode** | `permission.asked`、`question.asked`、V2 检测 | 避开 #33 的模型列表改动 |
-| **A5 claude** | SDK 升级到 0.3；修复重复执行；tool_use_id 配对；子代理过滤；原生图片；心跳；费用；CLI 回退参数 | 无（审批放到 C1） |
+| **A5 claude**（#40） | 去掉 Agent SDK，改为 CLI 双向 stream-json 加 stdio 控制协议；不重复执行；tool_use_id 配对；子代理过滤；原生图片；心跳；费用；auto 走分类器 | 无（审批放到 C1） |
 
 ### B 波：通用接入层（新文件为主，router 只加最少的注册代码）
 | PR | 内容 | 依赖 |
@@ -201,13 +201,13 @@ CLIAdapter ──────┼─ AcpAdapter（通用）：一份代码 + 预�
   - router 里微信特有的逻辑（引用消息路由、「继续」恢复、配额裁剪）在抽象时容易改坏。
   - 会话 key 要从 `uid` 改成 `平台:uid`，现有会话文件需要迁移。
   - 和 #27 的投递生命周期改造高度重叠，必须等 #27 稳定之后再做。
-- **建议**：这次大更新先不做。但 C1 的 InteractionRequest 会按平台无关的方式设计，给以后接飞书留好接口。要不要立项，由你决定。
+- **建议**：这次大更新先不做。但 C1 的 InteractionRequest 会按平台无关的方式设计（Claude 一侧对接 stdio 控制协议里的 can_use_tool），给以后接飞书留好接口。要不要立项，由你决定。
 
 ---
 
 ## 8. 风险与兼容性
 
-1. **Claude SDK 0.3 升级**：打包方式变了，改为下载平台原生二进制。npm 7 以上会自动装 peer deps，但安装体积和 `--ignore-scripts` 环境下能不能用需要实测。所以单独作为 A5，出问题可以单独回滚。
+1. **Claude 去掉 SDK**：stdio 控制协议没有正式文档，是参照 SDK 包内的实现来写的；以后 CLI 升级时可能会变，需要靠测试 fixture 加冒烟测试来盯住。好处是依赖为零，和用户本机 `claude` 的版本、登录态保持一致。
 2. **会话 ID 迁移**：Codex 和 Kimi 旧存的哨兵值 `'last'` / `'continue'` 需要兼容。读到旧值时当作「没有会话」，开一个新会话，并提示用户一次。
 3. **行为变化**：safe 模式从「实际上是 bypass」变成「真的会问你」，这是用户能感知到的变化，要在 README 和 `/mode` 的提示里写清楚。命令瘦身也是破坏性变更，所以升到 0.2.0。
 4. **ACP 的不确定性**：各家的模式 ID 不统一；OAuth 不能交互登录（必须提前登录或用 API Key）；有些 CLI 的 ACP 还在 preview（比如 Copilot）。预设只收录核实过的，其余只写文档。
