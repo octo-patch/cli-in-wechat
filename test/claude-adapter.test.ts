@@ -44,7 +44,8 @@ class FakeClaude {
     // Like the real CLI: closing stdin after the result lets the process exit.
     stdin.on('end', () => { this.stdinEnded = true; this.exit(0); });
     Object.assign(child, {
-      stdin, stdout: this.stdout, stderr: this.stderr, killed: false, exitCode: null, pid: 4242,
+      // No pid: on Windows killProc would shell out to `taskkill` for a fake pid and never exit.
+      stdin, stdout: this.stdout, stderr: this.stderr, killed: false, exitCode: null, pid: undefined,
       kill: (sig: string) => { this.killedWith = sig; Object.assign(child, { killed: true }); this.exit(null, sig); return true; },
     });
     this.child = child;
