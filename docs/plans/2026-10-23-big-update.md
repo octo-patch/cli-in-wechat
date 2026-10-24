@@ -94,7 +94,7 @@ CLIAdapter ──────┼─ AcpAdapter（通用）：一份代码 + 预�
 - [ ] 一次 execute 只 spawn 一次，不设任何回退，因此不会重复执行。
 - [ ] 工具结果用 `tool_use_id` 配对；过滤掉 `parent_tool_use_id` 不为空的子代理消息，子代理只显示「开始/完成」两行。
 - [ ] 补上 `disallowedTools`、`--add-dir`、`--max-turns`；读取 `total_cost_usd` 和 usage；在 system init 消息里提前拿到 session_id；`tool_progress` 当作心跳，用来重置空闲超时；取消时先发 interrupt，再兜底 kill。
-- [ ] 模式：auto 映射到 `--permission-mode auto`（分类器自动审批，用户已选定；本机 CLI 不支持时降级到 bypass，并提示一次），safe 映射到 default，plan 映射到 plan（不能写文件）。
+- [ ] 模式：auto 继续映射到 bypass（用户 2026-10-24 确认，不改用 auto 分类器），safe 映射到 default，plan 映射到 plan（不能写文件）。
 - [ ] can_use_tool：AskUserQuestion 走 askUser。其他工具在 C1 之前先拒绝并给出提示；C1 之后走 InteractionRequest，提供允许一次、本会话总是允许（用协议里的 permission suggestions）、拒绝三个选项。
 
 ### Codex CLI（原生，exec --json）
@@ -166,7 +166,7 @@ CLIAdapter ──────┼─ AcpAdapter（通用）：一份代码 + 预�
 | **A2 gemini** | 信任环境变量；stream-json；`--session-id`；审批模式映射；报错文案 | 无 |
 | **A3 kimi** | stream-json；`-S <id>`；不再拿 stderr 当答案 | 无 |
 | **A4 opencode** | `permission.asked`、`question.asked`、V2 检测 | 避开 #33 的模型列表改动 |
-| **A5 claude**（#40） | 去掉 Agent SDK，改为 CLI 双向 stream-json 加 stdio 控制协议；不重复执行；tool_use_id 配对；子代理过滤；原生图片；心跳；费用；auto 走分类器 | 无（审批放到 C1） |
+| **A5 claude**（#40） | 去掉 Agent SDK，改为 CLI 双向 stream-json 加 stdio 控制协议；不重复执行；tool_use_id 配对；子代理过滤；原生图片；心跳；费用；auto 仍走 bypass | 无（审批放到 C1） |
 
 ### B 波：通用接入层（新文件为主，router 只加最少的注册代码）
 | PR | 内容 | 依赖 |
