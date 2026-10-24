@@ -462,6 +462,7 @@ function boot(dir: string, bootId: string, execute: Execute, maxItemsPerWindow =
   return {
     router,
     store,
+    client,
     delivered,
     calls,
     async poll(msgs: WeixinMessage[], cursor: string) {
@@ -529,4 +530,124 @@ test('after a restart a bare digit meant for a lost approval gets a hint, not a 
   assert.equal(byId['1'].phase, 'recovery-required');
   assert.equal(byId['1'].recovery?.reason, 'agent-interrupted');
   assert.equal(byId['2'].completion, 'no-agent');
+});
+
+test('a prompt queued behind an exhausted window only starts its 5-minute clock once delivered', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'wechat-approvals-'));
+  const results: Array<string | null> = [];
+  let client!: ILinkClient;
+  const proc = boot(dir, 'boot-1', async (_prompt, opts) => {
+    // Two items per window: earlier output already spent this one before the agent asks.
+    await client.sendText(UID, 'progress 1', { priority: 'intermediate' });
+    await client.sendText(UID, 'progress 2', { priority: 'intermediate' });
+    results.push(await opts.requestPermission({ title: 'Run `make`', options: FULL_OPTIONS }));
+    return { text: 'built' };
+  }, 2);
+  client = proc.client;
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+
+  await proc.poll([inbound(1, 'build it')], 'cursor-1');
+  await waitFor(() => client.getDeliveryStatus(UID).pending.length === 1, 'prompt queued');
+  assert.equal(proc.delivered.length, 2);
+  assert.equal(client.getDeliveryStatus(UID).pending[0].priority, 'control');
+
+  // Ten minutes in the queue: the user never saw it, so it must not have been auto-rejected.
+  for (let i = 0; i < 120; i++) t.mock.timers.tick(5_000);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(results, []);
+
+  // 继续 opens a new window; the queued prompt goes out and only now is the clock armed.
+  await proc.poll([inbound(2, '继续')], 'cursor-2');
+  await waitFor(() => proc.delivered.length === 3, 'prompt delivered');
+  assert.match(proc.delivered[2], /^Claude 请求权限：Run `make`/);
+  t.mock.timers.tick(5_000); // the delivery check notices and arms the reply clock
+  t.mock.timers.tick(294_000);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(results, [], 'still inside the 5 minutes counted from delivery');
+  t.mock.timers.tick(6_000);
+  await proc.router.whenIdle();
+
+  assert.deepEqual(results, [null]);
+  assert.deepEqual(proc.calls, ['build it']);
+  assert.match(proc.delivered.at(-1)!, /^built\n\n— Claude/);
+});
+
+test('cancel still settles a prompt that is waiting in the outbox', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wechat-approvals-'));
+  const results: Array<string | null> = [];
+  let client!: ILinkClient;
+  const proc = boot(dir, 'boot-1', async (_prompt, opts) => {
+    await client.sendText(UID, 'progress 1', { priority: 'intermediate' });
+    results.push(await opts.requestPermission({ title: 'Run `make`', options: FULL_OPTIONS }));
+    return { text: 'built' };
+  }, 1);
+  client = proc.client;
+
+  await proc.poll([inbound(1, 'build it')], 'cursor-1');
+  await waitFor(() => client.getDeliveryStatus(UID).pending.length === 1, 'prompt queued');
+  await proc.poll([inbound(2, '/cancel')], 'cursor-2');
+  await proc.router.whenIdle();
+  assert.deepEqual(results, [null]);
+  assert.equal((proc.router as any).interactions.size, 0);
+});
+
+for (const mode of ['safe', 'auto'] as const) {
+  test(`${mode} mode: streaming ${mode === 'safe' ? 'keeps the last window item for the prompt' : 'is unchanged'}`, async () => {
+    const results: Array<string | null> = [];
+    const { router, messages, approvals, reply } = createRouter({
+      claude: async (_prompt, opts) => {
+        opts.onIntermediate({ type: 'text', content: 'part one' });
+        opts.onIntermediate({ type: 'tool_use', content: '- Bash: ls' });
+        opts.onIntermediate({ type: 'text', content: 'part two' });
+        opts.onIntermediate({ type: 'tool_use', content: '- Bash: rm' });
+        for (let i = 0; i < 10; i++) await new Promise((resolve) => setImmediate(resolve));
+        if (mode === 'safe') results.push(await opts.requestPermission({ title: 'rm -rf dist', options: FULL_OPTIONS }));
+        return { text: 'part one\n\npart two\n\ndone' };
+      },
+    });
+    Object.assign(router.sessions.get('u1'), { mode, msgMode: 'verbose' });
+    // A three-item window that shrinks with every message sent.
+    router.ilink.getDeliveryStatus = () => ({ quota: { generation: 1, remainingItems: Math.max(0, 3 - messages.length) }, pending: [], failed: [] });
+
+    const run = router.exec('u1', 'claude', 'clean up');
+    if (mode === 'safe') {
+      await waitFor(() => approvals().length === 1);
+      await reply('1');
+    }
+    await run;
+
+    if (mode === 'auto') {
+      assert.deepEqual(messages.slice(0, 3).map((m) => m.text), ['part one', 'Activity\n- Bash: ls', 'part two']);
+      return;
+    }
+    assert.deepEqual(results, ['opt-once']);
+    // 'part two' would have spent the last item; it was held and the prompt got it instead.
+    assert.deepEqual(messages.slice(0, 3).map((m) => m.text.split('\n')[0]), ['part one', 'Activity', 'Claude 请求权限：rm -rf dist']);
+    assert.ok(!messages.some((m) => m.text === 'part two'));
+    // Nothing is lost: the held-back text makes the final answer go out in full.
+    assert.match(messages.at(-1)!.text, /part two\n\ndone/);
+    assert.equal(messages.at(-1)!.options?.priority, 'final');
+  });
+}
+
+test('nothing streams while a prompt is waiting for the user', async () => {
+  const { router, messages, approvals, reply } = createRouter({
+    claude: async (_prompt, opts) => {
+      const pending = opts.requestPermission({ title: 'write a.ts', options: FULL_OPTIONS });
+      for (let i = 0; i < 5; i++) await new Promise((resolve) => setImmediate(resolve));
+      opts.onIntermediate({ type: 'text', content: 'while waiting' });
+      opts.onIntermediate({ type: 'tool_use', content: '- Read: a.ts' });
+      for (let i = 0; i < 5; i++) await new Promise((resolve) => setImmediate(resolve));
+      await pending;
+      return { text: 'while waiting\n\nok' };
+    },
+  });
+  Object.assign(router.sessions.get('u1'), { msgMode: 'verbose' });
+  const run = router.exec('u1', 'claude', 'go');
+  await waitFor(() => approvals().length === 1);
+  for (let i = 0; i < 20; i++) await new Promise((resolve) => setImmediate(resolve));
+  await reply('1');
+  await run;
+  assert.ok(!messages.some((m) => m.text === 'while waiting'));
+  assert.match(messages.at(-1)!.text, /^while waiting\n\nok/);
 });

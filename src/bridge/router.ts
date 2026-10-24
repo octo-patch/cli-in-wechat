@@ -51,6 +51,7 @@ interface PendingInteraction {
   /** Sent once after an invalid reply; absent when every reply is a valid answer. */
   retryText?: string;
   retried: boolean;
+  done: boolean;
   /** Try to settle with this reply; false when the reply is not a valid answer. */
   answer: (reply: string) => boolean;
   /** Settle without asking when the answer is already known (a session grant); true if settled. */
@@ -59,7 +60,10 @@ interface PendingInteraction {
   timer?: ReturnType<typeof setTimeout>;
 }
 
+/** Reply window, counted from when the prompt actually reached WeChat. */
 const INTERACTION_TIMEOUT_MS = 300_000;
+/** How often a prompt still queued in the outbox is checked for delivery. */
+const PROMPT_DELIVERY_POLL_MS = 5_000;
 /** A reply that only makes sense as an answer to a numbered prompt: "2", "1,3". */
 const BARE_ANSWER = /^\d{1,2}(?:\s*[,，]\s*\d{1,2})*$/;
 /** A late bare answer within this window gets a hint instead of reaching an Agent as a prompt. */
@@ -1901,9 +1905,8 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
   }): Promise<T> {
     return new Promise<T>((resolve, reject) => {
       const signals = (spec.signals || []).filter((s): s is AbortSignal => Boolean(s));
-      let done = false;
       const finish = (): void => {
-        done = true;
+        item.done = true;
         clearTimeout(item.timer);
         for (const s of signals) s.removeEventListener('abort', onAbort);
         this.dropInteraction(uid, item);
@@ -1912,15 +1915,16 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
         text: spec.text,
         retryText: spec.retryText,
         retried: false,
+        done: false,
         preempt: () => {
-          const value = done ? undefined : spec.preempt?.();
+          const value = item.done ? undefined : spec.preempt?.();
           if (value === undefined) return false;
           finish();
           resolve(value);
           return true;
         },
         answer: (reply) => {
-          if (done) return true;
+          if (item.done) return true;
           const value = spec.parse(reply);
           if (value === undefined) return false;
           finish();
@@ -1928,7 +1932,7 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
           return true;
         },
         expire: (why) => {
-          if (done) return;
+          if (item.done) return;
           finish();
           if (why === 'timeout' || why === 'cancelled') this.expiredInteractions.set(uid, Date.now());
           const value = spec.onExpire(why);
@@ -1946,16 +1950,44 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
     });
   }
 
-  /** Send the head interaction and arm its timeout. Control priority: never squeezed out by
-   *  streamed intermediate/activity output, and it does not eat into the final reserve. */
+  /** Send the head interaction. Control priority: never held back by the intermediate/activity
+   *  caps, and it does not eat into the final reserve. */
   private showInteraction(uid: string, item: PendingInteraction): void {
     if (item.preempt()) return;
-    item.timer = setTimeout(() => item.expire('timeout'), INTERACTION_TIMEOUT_MS);
-    this.ilink.sendText(uid, item.text, { priority: 'control' }).catch((err) => {
-      if (isDeliveryFinalizationError(err)) return; // delivered; only local bookkeeping failed
-      log.error('[interaction] 无法发送提问/审批消息:', err);
+    let itemIds: string[] = [];
+    this.ilink.sendText(uid, item.text, {
+      priority: 'control',
+      onEnqueued: (items) => { itemIds = items.map((queued) => queued.itemId); },
+    }).then(
+      () => this.armWhenDelivered(uid, item, itemIds),
+      (err) => {
+        // A finalization error means it was delivered; only local bookkeeping failed.
+        if (isDeliveryFinalizationError(err)) { this.armWhenDelivered(uid, item, []); return; }
+        log.error('[interaction] 无法发送提问/审批消息:', err);
+        item.expire('unsent');
+      },
+    );
+  }
+
+  /**
+   * The reply clock starts only once the prompt really left the outbox: a prompt queued behind
+   * an exhausted window or a rate-limit backoff is invisible to the user, so it must not time
+   * out. Until then poll the outbox (it drains on the next inbound, e.g. 继续, or when a backoff
+   * ends); cancel, shutdown and the adapter signal still settle it meanwhile.
+   */
+  private armWhenDelivered(uid: string, item: PendingInteraction, itemIds: string[]): void {
+    if (item.done) return;
+    const status = itemIds.length > 0 ? this.deliveryStatus(uid) : undefined;
+    if (status?.pending.some((queued) => itemIds.includes(queued.itemId))) {
+      item.timer = setTimeout(() => this.armWhenDelivered(uid, item, itemIds), PROMPT_DELIVERY_POLL_MS);
+      return;
+    }
+    if (status?.failed?.some((failed) => itemIds.includes(failed.itemId))) {
+      log.error('[interaction] 提问/审批消息被拒收，按未发送处理');
       item.expire('unsent');
-    });
+      return;
+    }
+    item.timer = setTimeout(() => item.expire('timeout'), INTERACTION_TIMEOUT_MS);
   }
 
   private dropInteraction(uid: string, item: PendingInteraction): void {
@@ -2119,6 +2151,21 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
     });
   }
 
+  /**
+   * Streaming yields to approval prompts: nothing streams while a prompt waits for the user, and in
+   * `safe` mode (the only one that asks) the last free item of a delivery window is kept for a
+   * prompt instead of being spent on progress text. Held-back text is not lost: the final answer
+   * is then sent in full rather than as a footer. Router-side only; the outbox and quota rules
+   * (src/ilink) and the durable task lifecycle are untouched.
+   */
+  private holdStreamForPrompt(uid: string, mode?: string): boolean {
+    if (this.interactions.has(uid)) return true;
+    if (mode !== 'safe') return false;
+    const status = this.deliveryStatus(uid) as (DeliveryStatusView & { quota: { remainingItems?: number } }) | undefined;
+    const remaining = status?.quota.remainingItems;
+    return typeof remaining === 'number' && remaining - status!.pending.length <= 1;
+  }
+
   /** "本会话" ends with /new, /clear, a workDir change or a restart (grants are memory-only). */
   private clearSessionGrants(uid: string): void {
     for (const key of [...this.sessionGrants.keys()]) {
@@ -2151,17 +2198,25 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
     // Track if we've streamed text (to avoid duplicate with final result)
     let hasStreamedText = false;
     let intermediateSendFailed = false;
+    /** Streamed text was held back (see holdStreamForPrompt): the final answer then carries it all. */
+    let streamHeldBack = false;
 
     // Serialize intermediate sends in-order to avoid burst/concurrency.
     let sendQueue: Promise<unknown> = Promise.resolve();
     const enqueueIntermediateSend = (text: string, priority: 'intermediate' | 'activity' = 'intermediate'): void => {
       if (!text.trim()) return;
       sendQueue = sendQueue
-        .then(() => this.ilink.sendText(uid, text, {
-          streamType: 'intermediate',
-          priority,
-          generation: taskGeneration,
-        }))
+        .then(() => {
+          if (this.holdStreamForPrompt(uid, settings.mode)) {
+            if (priority === 'intermediate') streamHeldBack = true;
+            return;
+          }
+          return this.ilink.sendText(uid, text, {
+            streamType: 'intermediate',
+            priority,
+            generation: taskGeneration,
+          });
+        })
         .catch((err) => {
           intermediateSendFailed = true;
           log.error(`[${toolName}] 发送中间消息失败:`, err);
@@ -2288,7 +2343,7 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
           error: result.error,
           duration: result.duration || (Date.now() - start),
           notice,
-          hasStreamedText,
+          hasStreamedText: hasStreamedText && !streamHeldBack,
           intermediateSendFailed,
           finalActivityLines: [...finalActivityLines],
           generation: taskGeneration,
