@@ -235,7 +235,7 @@ export class AcpAdapter implements CLIAdapter {
       if (settings.mode === 'auto') return select(pick('allow_once', 'allow_always'));
       if (settings.mode === 'plan') return select(pick('reject_once', 'reject_always'));
 
-      // safe: delegate to the host's approval hook when wired (WeChat approvals land in a later PR).
+      // safe: delegate to the host's approval hook when wired (the bridge asks the user in WeChat).
       if (opts.requestPermission) {
         const tool = params?.toolCall ?? {};
         const req: PermissionRequest = {
