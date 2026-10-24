@@ -126,6 +126,27 @@ test('@mentions and chains resolve any registry name; an uninstalled one never f
   assert.deepEqual(chains, [['qwen', 'my-agent']]);
 });
 
+test('a chain naming an unknown or uninstalled tool is refused with a hint, never run on one tool', async () => {
+  const { send, last, execs, chains } = createRouter();
+  const tools = '可用: claude, opencode, qwen, my-agent';
+
+  await send('@claude>codex review this');
+  assert.equal(last(), `"codex" 未安装或不可用，链式调用未执行\n${tools}`);
+  await send('@gemini>claude review this');
+  assert.equal(last(), `"gemini" 未安装或不可用，链式调用未执行\n${tools}`);
+  await send('@claude>nope review this');
+  assert.equal(last(), `未知终端: @nope，链式调用未执行\n${tools}`);
+  await send('@claude>qwen');
+  assert.equal(last(), '用法: @claude>qwen <内容>');
+
+  // Before: these fell through to "@claude …" and ran the whole text on Claude.
+  assert.deepEqual(execs, []);
+  assert.deepEqual(chains, []);
+
+  await send('@cc>qwen 写个测试');
+  assert.deepEqual(chains, [['claude', 'qwen']]);
+});
+
 test('/help lists /use with installed tools and only the shortcuts that work here', async () => {
   const { slash, last } = createRouter();
   await slash('/help');

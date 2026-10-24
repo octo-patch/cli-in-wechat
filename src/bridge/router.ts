@@ -233,6 +233,16 @@ export class Router {
     return this.availableTools().map((tool) => tool.name).join(', ') || '无';
   }
 
+  /** Why `@a>b` can't run (unknown or uninstalled tool), or undefined when both are usable. */
+  private chainProblem(rawA: string, rawB: string): string | undefined {
+    for (const raw of [rawA, rawB]) {
+      const name = this.resolveToolName(raw);
+      if (!name) return `未知终端: @${raw}，链式调用未执行\n可用: ${this.availableToolList()}`;
+      if (!this.registry.isAvailable(name)) return `"${name}" 未安装或不可用，链式调用未执行\n可用: ${this.availableToolList()}`;
+    }
+    return undefined;
+  }
+
   /** /use, /cc …: switch the default tool when it is installed. */
   private async switchTool(uid: string, raw: string): Promise<void> {
     const name = this.resolveToolName(raw);
@@ -903,17 +913,20 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
     // ── Parse: @tool1>tool2 chain, @tool single, >> relay, plain text ──
 
     // Pattern: @tool1>tool2 prompt  →  chain: tool1 processes, output feeds tool2
-    const chainMatch = trimmed.match(/^@([\w-]+)>([\w-]+)\s+([\s\S]+)$/);
+    const chainMatch = trimmed.match(/^@([\w-]+)>([\w-]+)(?:\s+([\s\S]*))?$/);
     if (chainMatch) {
-      const t1 = this.resolveToolName(chainMatch[1]);
-      const t2 = this.resolveToolName(chainMatch[2]);
-      const prompt = chainMatch[3].trim();
-      if (t1 && t2 && this.registry.isAvailable(t1) && this.registry.isAvailable(t2)) {
-        const busy = [t1, t2].find(t => this.active.has(`${uid}:${t}`));
-        if (busy) { await this.ilink.sendText(uid, this.busyText(uid, busy)); return; }
-        await this.chain(uid, t1, t2, prompt + mediaContext, media, taskGeneration, run);
-        return;
-      }
+      // A chain that can't run as written is refused: falling back to one tool (or the default)
+      // would run the prompt somewhere the user didn't send it.
+      const problem = this.chainProblem(chainMatch[1], chainMatch[2]);
+      if (problem) { await this.ilink.sendText(uid, problem); return; }
+      const prompt = (chainMatch[3] ?? '').trim();
+      if (!prompt) { await this.ilink.sendText(uid, `用法: @${chainMatch[1]}>${chainMatch[2]} <内容>`); return; }
+      const t1 = this.resolveToolName(chainMatch[1])!;
+      const t2 = this.resolveToolName(chainMatch[2])!;
+      const busy = [t1, t2].find(t => this.active.has(`${uid}:${t}`));
+      if (busy) { await this.ilink.sendText(uid, this.busyText(uid, busy)); return; }
+      await this.chain(uid, t1, t2, prompt + mediaContext, media, taskGeneration, run);
+      return;
     }
 
     // Pattern: >> prompt  →  relay: prepend last response as context
@@ -2085,8 +2098,8 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
     const head = this.interactions.get(uid)?.[0];
     if (!head?.delivered) return false;
     let reply = text;
-    const at = text.match(/^@(\w+)(?:[\s：:]+([\s\S]*))?$/);
-    const mentioned = at ? this.mentionedTool(at[1]) : undefined;
+    const at = text.match(/^@([\w-]+)(?:[\s：:]+([\s\S]*))?$/);
+    const mentioned = at ? this.resolveToolName(at[1]) : undefined;
     if (mentioned) {
       if (mentioned !== head.toolName) return false;
       reply = (at![2] || '').trim();
@@ -2101,11 +2114,6 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
       head.expire('invalid');
     }
     return true;
-  }
-
-  /** Registry name behind an @mention, or undefined when it names no tool. */
-  private mentionedTool(name: string): string | undefined {
-    return TOOL_ALIASES[name.toLowerCase()];
   }
 
   /** The "<tool> 在忙" reply, saying so explicitly when the tool is waiting on the user. */
