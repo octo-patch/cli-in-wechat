@@ -1,7 +1,8 @@
-import { existsSync, mkdirSync, readFileSync, renameSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdirSync, readFileSync, renameSync } from 'node:fs';
 import { dirname } from 'node:path';
 
 import { atomicWrite } from '../config.js';
+import { log } from '../utils/logger.js';
 import type { OutboxPriority } from '../ilink/outbox.js';
 import type { DownloadedMedia } from '../utils/media.js';
 
@@ -55,6 +56,8 @@ export interface TaskOutput {
   /** True once the outbox durably holds every chunk of this output. */
   enqueued: boolean;
   itemIds?: string[];
+  /** Size of the text once it was handed to the outbox (the text itself is dropped). */
+  bytes?: number;
 }
 
 export interface TaskFileStep {
@@ -159,7 +162,9 @@ interface PersistedTasks {
 
 const DEFAULT_COMPLETED_RETENTION_MS = 24 * 60 * 60_000;
 const DEFAULT_RECOVERY_RETENTION_MS = 30 * 24 * 60 * 60_000;
-const DEFAULT_MAX_RETAINED_TASKS = 500;
+const DEFAULT_MAX_RETAINED_TASKS = 200;
+/** Inbound text kept on terminal tasks: enough to recognise the message, no full prompt. */
+const TERMINAL_SNIPPET_CHARS = 200;
 const MAX_HISTORY = 20;
 
 export class TaskTransitionError extends Error {
@@ -188,6 +193,8 @@ export class InboundTaskStore {
   private readonly recoveryRetentionMs: number;
   private readonly maxRetainedTasks: number;
   private readonly faultHook?: TaskStoreOptions['faultHook'];
+  /** Set when the file on disk could not be used; the store then starts empty. */
+  corruption?: { movedTo?: string; reason: string };
 
   constructor(private readonly filePath?: string, options: TaskStoreOptions = {}) {
     this.now = options.now ?? Date.now;
@@ -264,10 +271,17 @@ export class InboundTaskStore {
     }, bootId);
   }
 
-  /** running → delivery-pending with the Agent outcome as the durable source of truth. */
-  recordOutcome(taskId: string, bootId: string, outcome: DeliveryOutcome): InboundTask {
+  /**
+   * running → delivery-pending with the Agent outcome as the durable source of truth.
+   * When the final message sequence is already known (no media step), pass it as
+   * `outputs` so the outcome and its outputs land in one write.
+   */
+  recordOutcome(taskId: string, bootId: string, outcome: DeliveryOutcome, outputs?: TaskOutput[]): InboundTask {
     const task = this.requireOwned(taskId, bootId, ['running'], 'recordOutcome');
-    return this.transition('outcome', task, { phase: 'delivery-pending', outcome }, bootId);
+    return this.transition('outcome', task, {
+      phase: 'delivery-pending',
+      ...(outputs ? { outcome: supersededOutcome(outcome), outputs } : { outcome }),
+    }, bootId);
   }
 
   setFiles(taskId: string, files: TaskFileStep[]): InboundTask {
@@ -285,7 +299,11 @@ export class InboundTaskStore {
 
   setOutputs(taskId: string, outputs: TaskOutput[]): InboundTask {
     const task = this.requirePhase(taskId, ['delivery-pending', 'recovery-required'], 'setOutputs');
-    return this.transition('outputs', task, { outputs });
+    // The outputs now carry everything still to be sent; drop the raw outcome body.
+    return this.transition('outputs', task, {
+      outputs,
+      ...(task.outcome ? { outcome: supersededOutcome(task.outcome) } : {}),
+    });
   }
 
   markOutputEnqueued(taskId: string, index: number, itemIds: string[]): InboundTask {
@@ -293,7 +311,10 @@ export class InboundTaskStore {
     const current = task.outputs?.[index];
     if (!current) throw new TaskTransitionError(taskId, task.phase, `markOutputEnqueued(${index})`);
     if (current.enqueued) return clone(task);
-    const outputs = task.outputs!.map((output, i) => (i === index ? { ...output, enqueued: true, itemIds } : output));
+    // The outbox owns the text from here on; keep only its identity in the ledger.
+    const outputs = task.outputs!.map((output, i) => (i === index
+      ? { ...output, text: '', bytes: Buffer.byteLength(output.text, 'utf8'), enqueued: true, itemIds }
+      : output));
     return this.transition(`enqueued:${index}`, task, { outputs });
   }
 
@@ -304,7 +325,7 @@ export class InboundTaskStore {
         ? ['recovery-required']
         : ['dispatching', 'running'];
     const task = this.requirePhase(taskId, allowed, `complete(${completion})`);
-    return this.transition('complete', task, {
+    return this.transition('complete', compactTerminal(task), {
       phase: 'completed',
       completion,
       ...(detail ? { completionDetail: detail } : {}),
@@ -380,33 +401,95 @@ export class InboundTaskStore {
 
   private load(filePath: string): void {
     if (!existsSync(filePath)) return;
-    let parsed: Partial<PersistedTasks>;
+    let parsed: Partial<PersistedTasks> | undefined;
+    let reason: string | undefined;
     try {
       parsed = JSON.parse(readFileSync(filePath, 'utf8')) as Partial<PersistedTasks>;
+      if (parsed?.schemaVersion !== 1 || !Array.isArray(parsed.tasks)) reason = 'unsupported schema';
     } catch (err) {
-      // Never silently discard durable state: move it aside for an operator and
-      // start empty. Inbounds it covered have already been acknowledged, so the
-      // only consequence is that their tasks are not resumed.
-      const aside = `${filePath}.corrupt-${this.now()}`;
-      try { renameSync(filePath, aside); } catch { /* best effort */ }
-      throw new TaskStoreCorruptionError(filePath, aside, err);
+      reason = `unreadable: ${err instanceof Error ? err.message : String(err)}`;
     }
-    if (parsed.schemaVersion !== 1 || !Array.isArray(parsed.tasks)) {
-      const aside = `${filePath}.corrupt-${this.now()}`;
-      try { renameSync(filePath, aside); } catch { /* best effort */ }
-      throw new TaskStoreCorruptionError(filePath, aside, new Error('unsupported schema'));
+    if (reason || !parsed?.tasks) {
+      this.quarantine(filePath, reason || 'unreadable');
+      return;
     }
-    for (const task of parsed.tasks) {
-      if (task && typeof task.taskId === 'string' && typeof task.phase === 'string') this.tasks.set(task.taskId, task);
+    for (const raw of parsed.tasks) {
+      const problem = invalidTaskReason(raw);
+      if (problem) {
+        // A partial record cannot be resumed or safely classified; keeping it
+        // would also pin it forever since pruning keys off its fields.
+        log.error(`[task] 丢弃无法识别的任务记录 (${problem}): ${describeRaw(raw)}`);
+        continue;
+      }
+      this.tasks.set(raw.taskId, raw);
     }
+  }
+
+  /** Never silently discard durable state: preserve it for an operator and start empty. */
+  private quarantine(filePath: string, reason: string): void {
+    const aside = `${filePath}.corrupt-${this.now()}`;
+    let movedTo: string | undefined;
+    try {
+      renameSync(filePath, aside);
+      movedTo = aside;
+    } catch {
+      try {
+        copyFileSync(filePath, aside);
+        movedTo = aside;
+      } catch { /* nothing more we can do; the next write replaces the file */ }
+    }
+    this.corruption = { movedTo, reason };
+    log.error(`[task] 入站任务记录不可用 (${reason})，${movedTo ? `已保存到 ${movedTo}` : '且无法另存，将被覆盖'}，以空记录启动。`);
+    log.error('[task] 其中已确认但尚未执行或尚未交付的入站消息不会被自动恢复，请检查上述文件。');
   }
 }
 
-export class TaskStoreCorruptionError extends Error {
-  constructor(public readonly filePath: string, public readonly movedTo: string | undefined, public readonly cause: unknown) {
-    super(`inbound task store is unreadable: ${filePath}${movedTo ? ` (moved to ${movedTo})` : ''}`);
-    this.name = 'TaskStoreCorruptionError';
-  }
+const TASK_PHASES = new Set<TaskPhase>([
+  'received', 'dispatching', 'running', 'delivery-pending', 'completed', 'recovery-required',
+]);
+
+function invalidTaskReason(raw: unknown): string | undefined {
+  if (!raw || typeof raw !== 'object') return 'not an object';
+  const task = raw as Partial<InboundTask>;
+  if (typeof task.taskId !== 'string' || !task.taskId) return 'missing taskId';
+  if (typeof task.phase !== 'string' || !TASK_PHASES.has(task.phase as TaskPhase)) return 'unknown phase';
+  if (typeof task.userId !== 'string' || typeof task.messageId !== 'string') return 'missing user/message id';
+  if (typeof task.createdAt !== 'number' || typeof task.updatedAt !== 'number') return 'missing timestamps';
+  if (!task.inbound || typeof task.inbound.text !== 'string' || typeof task.inbound.refText !== 'string') return 'missing inbound';
+  if (!Array.isArray(task.history)) return 'missing history';
+  if (task.outputs !== undefined && !Array.isArray(task.outputs)) return 'malformed outputs';
+  if (task.phase === 'delivery-pending' && !task.outcome && !task.outputs) return 'delivery-pending without outcome';
+  return undefined;
+}
+
+function describeRaw(raw: unknown): string {
+  const task = (raw && typeof raw === 'object' ? raw : {}) as Partial<InboundTask>;
+  return `taskId=${String(task.taskId)} phase=${String(task.phase)}`;
+}
+
+function supersededOutcome(outcome: DeliveryOutcome): DeliveryOutcome {
+  return { kind: 'texts', texts: [], ...(outcome.generation !== undefined ? { generation: outcome.generation } : {}) };
+}
+
+/** Terminal tasks keep diagnostics only: no Agent output, no full prompt. */
+function compactTerminal(task: InboundTask): InboundTask {
+  const { outcome: _outcome, ...rest } = task;
+  const text = task.inbound.text;
+  return {
+    ...rest,
+    inbound: {
+      text: text.length > TERMINAL_SNIPPET_CHARS ? `${text.slice(0, TERMINAL_SNIPPET_CHARS)}…` : text,
+      refText: '',
+      ...(task.inbound.generation !== undefined ? { generation: task.inbound.generation } : {}),
+    },
+    ...(task.outputs ? {
+      outputs: task.outputs.map((output) => ({
+        ...output,
+        text: '',
+        bytes: output.bytes ?? Buffer.byteLength(output.text, 'utf8'),
+      })),
+    } : {}),
+  };
 }
 
 function clone<T>(value: T): T {

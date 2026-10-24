@@ -101,6 +101,12 @@ export class Router {
   private readonly bootId: string;
   /** In-process runner registry: at most one background runner per task id. */
   private runners = new Map<string, Promise<void>>();
+  /**
+   * Outputs the outbox accepted while the ledger could not record it (`taskId#index` → item ids).
+   * Consulted before any re-enqueue so an in-process resume never duplicates them; the durable
+   * mark is retried on every later touch.
+   */
+  private enqueuedNotRecorded = new Map<string, string[]>();
   private stopping = false;
 
   constructor(
@@ -409,7 +415,9 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
     const snippet = task.inbound.text.length > 60 ? `${task.inbound.text.slice(0, 60)}…` : task.inbound.text;
     const text = reason === 'interrupted-during-dispatch'
       ? `⚠️ 桥接服务在处理你的消息时中断（尚未调用 Agent）。为避免重复执行，没有自动重试。\n原消息: ${snippet}\n如需执行请重新发送；/tasks 查看详情。`
-      : `⚠️ 桥接服务中断时 ${tool ?? 'Agent'} 仍在执行你的消息，无法确认它是否已完成或已产生副作用，因此不会自动重跑。\n原消息: ${snippet}\n请检查工作区状态后再决定是否重新发送；/tasks 查看详情。`;
+      : reason === 'runner-error'
+        ? `⚠️ 处理你的消息时桥接服务内部出错，${tool ?? 'Agent'} 可能已开始执行，无法确认它是否已完成或已产生副作用，因此不会自动重跑。\n原消息: ${snippet}\n请检查工作区状态后再决定是否重新发送；/tasks 查看详情。`
+        : `⚠️ 桥接服务中断时 ${tool ?? 'Agent'} 仍在执行你的消息，无法确认它是否已完成或已产生副作用，因此不会自动重跑。\n原消息: ${snippet}\n请检查工作区状态后再决定是否重新发送；/tasks 查看详情。`;
     this.tasks.requireRecovery(task.taskId, {
       reason,
       at: Date.now(),
@@ -427,8 +435,26 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
   private needsDeliveryResume(task: InboundTask): boolean {
     if (task.phase === 'delivery-pending') return true;
     if (task.phase !== 'recovery-required' || !task.outputs) return false;
-    if (task.outputs.some((output) => !output.enqueued)) return true;
+    if (task.outputs.some((_output, index) => !this.isOutputEnqueued(task, index))) return true;
     return this.hasPendingTaskItems(task.userId, { taskId: task.taskId, store: this.tasks });
+  }
+
+  /** Does this user have task output still owed (other than `excludeTaskId`)? */
+  private hasOwedTaskDelivery(uid: string, excludeTaskId?: string): boolean {
+    return this.tasks.list({ userId: uid, phases: ['delivery-pending', 'recovery-required'] })
+      .some((task) => task.taskId !== excludeTaskId && this.needsDeliveryResume(task));
+  }
+
+  private isOutputEnqueued(task: InboundTask, index: number): boolean {
+    return Boolean(task.outputs?.[index]?.enqueued) || this.enqueuedNotRecorded.has(`${task.taskId}#${index}`);
+  }
+
+  private taskItemIds(task: InboundTask): Set<string> {
+    const ids = new Set(task.outputs?.flatMap((output) => output.itemIds || []) || []);
+    task.outputs?.forEach((_output, index) => {
+      for (const id of this.enqueuedNotRecorded.get(`${task.taskId}#${index}`) || []) ids.add(id);
+    });
+    return ids;
   }
 
   private outputPrefix(taskId: string, index: number): string {
@@ -449,12 +475,15 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
   }
 
   /** Each fresh inbound may open a delivery window: re-drive this user's unfinished task output. */
-  private resumeUserTasks(uid: string): void {
+  private resumeUserTasks(uid: string, excludeTaskId?: string): Promise<void> {
+    const runs: Promise<void>[] = [];
     for (const task of this.tasks.list({ userId: uid, phases: ['delivery-pending', 'recovery-required'] })) {
-      if (this.needsDeliveryResume(task)) {
-        this.runInBackground(task.taskId, () => this.resumeTaskDelivery(task.taskId));
-      }
+      if (task.taskId === excludeTaskId || !this.needsDeliveryResume(task)) continue;
+      this.runInBackground(task.taskId, () => this.resumeTaskDelivery(task.taskId));
+      const runner = this.runners.get(task.taskId);
+      if (runner) runs.push(runner);
     }
+    return Promise.allSettled(runs).then(() => undefined);
   }
 
   /** Delivery-only resume: never touches an adapter. */
@@ -486,14 +515,19 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
    *  ephemeral copy: the durable task stays `running` and the next boot reports
    *  it as recovery-required instead of silently claiming success. */
   private commitOutcome(run: TaskRun, outcome: DeliveryOutcome): TaskRun {
+    // Without a media step the final message sequence is already known: record the
+    // outcome and its outputs in one write instead of two.
+    const outputs = outcome.kind === 'texts' || !sendFileMarkerRegex().test(outcome.text)
+      ? this.buildOutputs(outcome, { sent: [], failed: [] })
+      : undefined;
     try {
-      run.store.recordOutcome(run.taskId, this.bootId, outcome);
+      run.store.recordOutcome(run.taskId, this.bootId, outcome, outputs);
       return run;
     } catch (err) {
       log.error(`[task] 无法持久化 ${run.taskId} 的 Agent 结果，将尽力直接发送:`, err);
       const fallback = this.ephemeralRun(this.tasks.get(run.taskId)?.userId ?? '', outcome.generation);
       fallback.store.markRunning(fallback.taskId, this.bootId, 'fallback');
-      fallback.store.recordOutcome(fallback.taskId, this.bootId, outcome);
+      fallback.store.recordOutcome(fallback.taskId, this.bootId, outcome, outputs);
       return fallback;
     }
   }
@@ -535,7 +569,8 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
   }
 
   private hasPendingTaskItems(uid: string, run: TaskRun): boolean {
-    const itemIds = new Set(run.store.get(run.taskId)?.outputs?.flatMap((output) => output.itemIds || []) || []);
+    const task = run.store.get(run.taskId);
+    const itemIds = task ? this.taskItemIds(task) : new Set<string>();
     if (itemIds.size === 0) return false;
     return (this.deliveryStatus(uid)?.pending || []).some((item) => itemIds.has(item.itemId));
   }
@@ -656,12 +691,31 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
     const outputs = task.outputs;
     for (let index = 0; index < outputs.length; index++) {
       const output = outputs[index];
+      const memoKey = `${run.taskId}#${index}`;
+      const unrecorded = this.enqueuedNotRecorded.get(memoKey);
+      if (!output.enqueued && unrecorded) {
+        // The outbox already holds this output; only the ledger mark is missing.
+        try {
+          run.store.markOutputEnqueued(run.taskId, index, unrecorded);
+          this.enqueuedNotRecorded.delete(memoKey);
+        } catch (err) {
+          log.error(`[task] 仍无法记录 ${memoKey} 已入队:`, err);
+        }
+        continue;
+      }
       if (!output.enqueued) {
         let recorded = false;
         const record = (itemIds: string[]): void => {
           if (recorded) return;
           recorded = true;
-          run.store.markOutputEnqueued(run.taskId, index, itemIds);
+          try {
+            run.store.markOutputEnqueued(run.taskId, index, itemIds);
+          } catch (err) {
+            // Never block or fail the send: the outbox has it. Remember it in memory so an
+            // in-process resume does not enqueue it again (restart reconciles from the outbox).
+            log.error(`[task] 输出已入队但无法记录 ${memoKey}:`, err);
+            this.enqueuedNotRecorded.set(memoKey, itemIds);
+          }
         };
         try {
           const results = await this.ilink.sendText(uid, output.text, {
@@ -684,11 +738,12 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
   /** delivery-pending → completed once every output left the outbox's pending queue. */
   private settleDelivery(uid: string, run: TaskRun): void {
     const task = run.store.get(run.taskId);
-    if (!task || task.phase !== 'delivery-pending' || !task.outputs || task.outputs.some((output) => !output.enqueued)) return;
+    if (!task || task.phase !== 'delivery-pending' || !task.outputs) return;
+    if (task.outputs.some((output) => !output.enqueued)) return;
     if (this.hasPendingTaskItems(uid, run)) return;
     // Items that ended in the outbox's failure retention (#26) stay owned by the
     // outbox (ambiguous ones are requeued on a later inbound); note them here.
-    const itemIds = new Set(task.outputs.flatMap((output) => output.itemIds || []));
+    const itemIds = this.taskItemIds(task);
     const failed = (this.deliveryStatus(uid)?.failed || []).filter((item) => itemIds.has(item.itemId));
     run.store.complete(run.taskId, 'delivered', failed.length > 0 ? `failed items: ${failed.map((item) => item.itemId).join(', ')}` : undefined);
   }
@@ -713,16 +768,21 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
     // Any fresh inbound may be the user's request to resume durable output.
     // The exact bare command is consumed; all other text continues normally.
     const recoverPending = deliveryClient.recoverPending;
-    if (trimmed === '继续' && recoverPending && deliveryStatus?.pending.length) {
+    // Owed task output counts too: an output that never reached the outbox (e.g. a
+    // failed enqueue) leaves `pending` empty, but 继续 must still only resume delivery.
+    const owesOutbox = Boolean(deliveryStatus?.pending?.length);
+    if (trimmed === '继续' && (owesOutbox || this.hasOwedTaskDelivery(uid, run?.taskId))) {
       const stopTyping = await this.ilink.startTyping(uid);
       try {
-        await recoverPending.call(this.ilink, uid);
+        await recoverPending?.call(this.ilink, uid);
       } catch (err) {
         log.error(`[delivery] 恢复 ${uid} 的排队消息失败:`, err);
+      }
+      try {
+        await this.resumeUserTasks(uid, run?.taskId);
       } finally {
         stopTyping();
       }
-      this.resumeUserTasks(uid);
       return;
     }
     if (recoverPending) {
@@ -732,7 +792,7 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
         log.error(`[delivery] 恢复 ${uid} 的排队消息失败:`, err);
       }
     }
-    this.resumeUserTasks(uid);
+    void this.resumeUserTasks(uid, run?.taskId);
 
     // Build media context for CLI
     let mediaContext = '';
@@ -984,7 +1044,7 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
         const open = this.tasks.list({
           userId: uid,
           phases: ['received', 'dispatching', 'running', 'delivery-pending', 'recovery-required'],
-        });
+        }).filter((task) => task.taskId !== run?.taskId);
         if (open.length === 0) { await reply('没有未完成的任务'); return true; }
         const lines = open.map((task) => {
           const snippet = task.inbound.text.length > 40 ? `${task.inbound.text.slice(0, 40)}…` : task.inbound.text;

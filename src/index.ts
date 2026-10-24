@@ -4,7 +4,7 @@ import { ILinkClient } from './ilink/client.js';
 import { AdapterRegistry } from './adapters/registry.js';
 import { SessionManager } from './bridge/session.js';
 import { Router } from './bridge/router.js';
-import { InboundTaskStore, TaskStoreCorruptionError } from './bridge/task-store.js';
+import { InboundTaskStore } from './bridge/task-store.js';
 import {
   loadConfig,
   loadCredentials,
@@ -115,15 +115,8 @@ async function main() {
     return ilink.sendText(value.userId, value.text);
   });
   const sessions = new SessionManager();
-  const taskStorePath = join(DATA_DIR, 'inbound-tasks.json');
-  let taskStore: InboundTaskStore;
-  try {
-    taskStore = new InboundTaskStore(taskStorePath);
-  } catch (err) {
-    if (!(err instanceof TaskStoreCorruptionError)) throw err;
-    log.error(`入站任务记录已损坏，已移到 ${err.movedTo ?? '(未能移动)'}，以空记录启动:`, err.cause);
-    taskStore = new InboundTaskStore(taskStorePath);
-  }
+  // An unusable ledger is preserved aside and logged by the store; the bridge starts empty.
+  const taskStore = new InboundTaskStore(join(DATA_DIR, 'inbound-tasks.json'));
   const router = new Router(ilink, registry, sessions, config, { taskStore });
 
   // Self-heal on session expiry (errcode -14/-13): re-run QR login instead of crashing.

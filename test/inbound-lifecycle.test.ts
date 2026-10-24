@@ -1,12 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { cpSync, existsSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
+import { chmodSync, cpSync, existsSync, mkdtempSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { ILinkClient } from '../src/ilink/client.js';
 import { Router } from '../src/bridge/router.js';
-import { InboundTaskStore, TaskStoreCorruptionError, TaskTransitionError, type InboundTask } from '../src/bridge/task-store.js';
+import { InboundTaskStore, TaskTransitionError, type InboundTask } from '../src/bridge/task-store.js';
 import type { BridgeConfig } from '../src/config.js';
 import type { Credentials, WeixinMessage } from '../src/ilink/types.js';
 import type { OutboxItem } from '../src/ilink/outbox.js';
@@ -98,6 +98,10 @@ function boot(dir: string, options: BootOptions) {
     delivered.push(item.text);
   };
   anyClient.startTyping = async () => () => {};
+  const fileSends: string[] = [];
+  anyClient.sendFile = anyClient.sendImage = anyClient.sendVideo = async (_userId: string, path: string) => {
+    fileSends.push(path);
+  };
 
   const adapterCalls: string[] = [];
   const adapter = options.adapter ?? defaultAdapter;
@@ -151,6 +155,7 @@ function boot(dir: string, options: BootOptions) {
     store,
     delivered,
     sendAttempts,
+    fileSends,
     adapterCalls,
     /** One long-poll round: the batch is processed, then the cursor is committed. */
     async poll(msgs: WeixinMessage[], cursor: string): Promise<void> {
@@ -181,7 +186,7 @@ type Process = ReturnType<typeof boot>;
 /** Arm a crash at one durable fault point; returns what had happened up to that instant. */
 function crashAt(point: string, dir: string) {
   const snapshotDir = freshDir();
-  const state = { fired: false, delivered: 0, adapterCalls: 0, process: undefined as Process | undefined };
+  const state = { fired: false, delivered: 0, adapterCalls: 0, fileSends: 0, process: undefined as Process | undefined };
   const hook = (name: string) => {
     if (state.fired || name !== point) return;
     state.fired = true;
@@ -189,6 +194,7 @@ function crashAt(point: string, dir: string) {
     // The hook can fire inside boot() (restart reconciliation) before `process` is set.
     state.delivered = state.process?.delivered.length ?? 0;
     state.adapterCalls = state.process?.adapterCalls.length ?? 0;
+    state.fileSends = state.process?.fileSends.length ?? 0;
   };
   return { snapshotDir, state, hook };
 }
@@ -302,10 +308,6 @@ const CRASH_MATRIX: Array<[string, Expectation]> = [
   ['after:running', { phase: 'recovery-required', adapterTotal: 0, adapterAfterRestart: 0, answerDeliveries: 0, noticeDeliveries: 1, recovery: 'agent-interrupted' }],
   ['before:outcome', { phase: 'recovery-required', adapterTotal: 1, adapterAfterRestart: 0, answerDeliveries: 0, noticeDeliveries: 1, recovery: 'agent-interrupted' }],
   ['after:outcome', { phase: 'completed', adapterTotal: 1, adapterAfterRestart: 0, answerDeliveries: 1, noticeDeliveries: 0 }],
-  ['before:files', { phase: 'completed', adapterTotal: 1, adapterAfterRestart: 0, answerDeliveries: 1, noticeDeliveries: 0 }],
-  ['after:files', { phase: 'completed', adapterTotal: 1, adapterAfterRestart: 0, answerDeliveries: 1, noticeDeliveries: 0 }],
-  ['before:outputs', { phase: 'completed', adapterTotal: 1, adapterAfterRestart: 0, answerDeliveries: 1, noticeDeliveries: 0 }],
-  ['after:outputs', { phase: 'completed', adapterTotal: 1, adapterAfterRestart: 0, answerDeliveries: 1, noticeDeliveries: 0 }],
   ['before:enqueued:0', { phase: 'completed', adapterTotal: 1, adapterAfterRestart: 0, answerDeliveries: 1, noticeDeliveries: 0 }],
   ['after:enqueued:0', { phase: 'completed', adapterTotal: 1, adapterAfterRestart: 0, answerDeliveries: 1, noticeDeliveries: 0 }],
   ['before:complete', { phase: 'completed', adapterTotal: 1, adapterAfterRestart: 0, answerDeliveries: 1, noticeDeliveries: 0 }],
@@ -468,7 +470,7 @@ for (const mode of ['compact', 'normal', 'verbose'] as const) {
     await baseline.idle();
     assert.ok(baseline.delivered.length >= 1);
 
-    for (const point of ['after:outcome', 'after:outputs', 'after:enqueued:0', 'before:enqueued:1']) {
+    for (const point of ['after:outcome', 'after:enqueued:0', 'before:enqueued:1', 'after:enqueued:1']) {
       const dir = freshDir();
       const crash = crashAt(point, dir);
       const first = boot(dir, { bootId: 'boot-1', mode, showThoughts: true, adapter: streamingAdapter(), faultHook: crash.hook });
@@ -477,7 +479,7 @@ for (const mode of ['compact', 'normal', 'verbose'] as const) {
       await first.idle();
       if (!crash.state.fired) {
         // Single-output modes have no second output to crash before.
-        assert.equal(point, 'before:enqueued:1');
+        assert.match(point, /enqueued:1$/);
         continue;
       }
 
@@ -749,28 +751,86 @@ test('an interrupted media send is reported, never resent', async () => {
     adapter: async () => ({ text: `done [SEND_FILE: ${file}]`, duration: 1_000 }),
   });
   crash.state.process = first;
-  (first.client as any).sendFile = async () => {};
   await first.poll([inbound(1)], 'cursor-1');
   await first.idle();
 
   const second = boot(crash.snapshotDir, { bootId: 'boot-2' });
-  let resent = 0;
-  (second.client as any).sendFile = async () => { resent += 1; };
   await second.idle();
-  assert.equal(resent, 0);
+  assert.equal(second.fileSends.length, 0);
   assert.equal(second.adapterCalls.length, 0);
   assert.equal(second.delivered.length, 1);
   assert.match(second.delivered[0], /^done\n\[⚠️ 文件发送失败: report\.txt（发送中断，无法确认是否已送达，未重发）\]/);
+});
+
+test('a crash around each media step sends the file and the final answer exactly once', async () => {
+  for (const point of ['after:outcome', 'before:files', 'after:files', 'after:file:0:sent', 'before:outputs', 'after:outputs']) {
+    const dir = freshDir();
+    const file = join(dir, 'report.txt');
+    writeFileSync(file, 'report');
+    const adapter: Adapter = async () => ({ text: `done [SEND_FILE: ${file}]`, duration: 1_000 });
+    const crash = crashAt(point, dir);
+    const first = boot(dir, { bootId: 'boot-1', faultHook: crash.hook, adapter });
+    crash.state.process = first;
+    await first.poll([inbound(1)], 'cursor-1');
+    await first.idle();
+    assert.equal(crash.state.fired, true, point);
+
+    const second = boot(crash.snapshotDir, { bootId: 'boot-2', adapter });
+    await second.idle();
+    assert.equal(crash.state.adapterCalls + second.adapterCalls.length, 1, point);
+    assert.equal(second.adapterCalls.length, 0, point);
+    assert.equal(crash.state.fileSends + second.fileSends.length, 1, point);
+    const visible = [...first.delivered.slice(0, crash.state.delivered), ...second.delivered];
+    assert.equal(visible.length, 1, point);
+    assert.match(visible[0], /^done\n\[已发送文件: report\.txt\]/, point);
+    assert.equal(second.tasks()[0].phase, 'completed', point);
+  }
 });
 
 test('a corrupt task ledger is moved aside instead of being silently discarded', () => {
   const dir = freshDir();
   const path = join(dir, 'inbound-tasks.json');
   writeFileSync(path, '{not json');
-  assert.throws(() => new InboundTaskStore(path), TaskStoreCorruptionError);
+  const store = new InboundTaskStore(path);
+  assert.deepEqual(store.list(), []);
+  assert.ok(store.corruption?.movedTo);
   assert.equal(existsSync(path), false);
   assert.ok(readdirSync(dir).some((name) => name.startsWith('inbound-tasks.json.corrupt-')));
   assert.deepEqual(new InboundTaskStore(path).list(), []);
+});
+
+test('a corrupt ledger that cannot be moved aside still lets the bridge start', () => {
+  const dir = freshDir();
+  const path = join(dir, 'inbound-tasks.json');
+  writeFileSync(path, JSON.stringify({ schemaVersion: 99, tasks: [] }));
+  const mode = statSync(dir).mode;
+  chmodSync(dir, 0o500);
+  try {
+    const store = new InboundTaskStore(path);
+    assert.deepEqual(store.list(), []);
+    assert.equal(store.corruption?.reason, 'unsupported schema');
+    assert.equal(store.corruption?.movedTo, undefined);
+    // And a second construction (e.g. a supervisor restart) does not throw either.
+    assert.deepEqual(new InboundTaskStore(path).list(), []);
+  } finally {
+    chmodSync(dir, mode);
+  }
+});
+
+test('structurally incomplete task records are dropped on load instead of pinned forever', () => {
+  const dir = freshDir();
+  const path = join(dir, 'inbound-tasks.json');
+  const good = new InboundTaskStore(path).handoff({ accountId: 'a', userId: 'u', messageId: '1', text: 't', refText: '' }).task;
+  const persisted = JSON.parse(readFileSync(path, 'utf8'));
+  persisted.tasks.push(
+    { taskId: 'a:u:2', phase: 'received', userId: 'u', messageId: '2', createdAt: 1, updatedAt: 1, history: [] },
+    { taskId: 'a:u:3', phase: 'bogus' },
+    { ...good, taskId: 'a:u:4', messageId: '4', phase: 'delivery-pending' },
+    null,
+  );
+  writeFileSync(path, JSON.stringify(persisted));
+  const store = new InboundTaskStore(path);
+  assert.deepEqual(store.list().map((task) => task.taskId), [good.taskId]);
 });
 
 test('terminal tasks are pruned on a bounded schedule while live tasks are kept', () => {
@@ -792,4 +852,116 @@ test('terminal tasks are pruned on a bounded schedule while live tasks are kept'
   assert.ok(store.get(live), 'received task is never pruned');
   for (let i = 0; i < 5; i += 1) make(`more-${i}`);
   assert.ok(store.get(live), 'live tasks survive the size cap');
+});
+
+// ─── Review follow-ups ───────────────────────────────────
+
+test('继续 resumes owed task output that never reached the outbox instead of prompting the agent', async () => {
+  const dir = freshDir();
+  const proc = boot(dir, { bootId: 'boot-1' });
+  const outbox = (proc.client as any).outbox;
+  const original = outbox.enqueueTextBatch.bind(outbox);
+  let failures = 1;
+  outbox.enqueueTextBatch = (inputs: any[]) => {
+    if (failures > 0 && inputs[0]?.itemId?.includes(':o0#')) {
+      failures -= 1;
+      throw new Error('outbox write failed');
+    }
+    return original(inputs);
+  };
+  await proc.poll([inbound(1)], 'cursor-1');
+  await proc.idle();
+  assert.equal(proc.client.getDeliveryStatus(UID).pending.length, 0, 'nothing queued in the outbox');
+  assert.equal(proc.tasks()[0].phase, 'delivery-pending');
+
+  await proc.poll([inbound(2, '继续')], 'cursor-2');
+  await proc.idle();
+  assert.equal(proc.adapterCalls.length, 1, '继续 was consumed as a delivery command');
+  assert.deepEqual(proc.delivered.map((text) => text.split('\n')[0]), ['answer-1']);
+  const second = proc.tasks().find((task) => task.messageId === '2');
+  assert.equal(second?.phase, 'completed');
+  assert.equal(second?.completion, 'no-agent');
+  assert.equal(proc.tasks().find((task) => task.messageId === '1')?.phase, 'completed');
+});
+
+test('a ledger write failure after the outbox accepted an output never duplicates it in-process', async () => {
+  const dir = freshDir();
+  let failMark = true;
+  const proc = boot(dir, {
+    bootId: 'boot-1',
+    faultHook: (point, task) => {
+      if (point === 'before:enqueued:0' && task.messageId === '1' && failMark) {
+        failMark = false;
+        throw new Error('ledger write failed');
+      }
+    },
+  });
+  await proc.poll([inbound(1)], 'cursor-1');
+  await proc.idle();
+  assert.equal(proc.delivered.length, 1, 'the send was not blocked by the bookkeeping failure');
+
+  await proc.poll([inbound(2, '/status')], 'cursor-2');
+  await proc.idle();
+  assert.equal(proc.delivered.filter((text) => text.startsWith('answer-1')).length, 1);
+  assert.equal(proc.adapterCalls.length, 1);
+  const task = proc.tasks().find((t) => t.messageId === '1')!;
+  assert.equal(task.phase, 'completed');
+  assert.equal(task.outputs?.[0].enqueued, true, 'the durable mark was retried and recorded');
+});
+
+test('/tasks does not list itself', async () => {
+  const dir = freshDir();
+  const proc = boot(dir, { bootId: 'boot-1' });
+  await proc.poll([inbound(1, '/tasks')], 'cursor-1');
+  await proc.idle();
+  assert.equal(proc.delivered.at(-1), '没有未完成的任务');
+});
+
+test('the ledger stays small: completed tasks keep diagnostics, not Agent output', async () => {
+  const dir = freshDir();
+  const reply = 'r'.repeat(20_000);
+  const proc = boot(dir, {
+    bootId: 'boot-1',
+    adapter: async () => ({ text: reply, duration: 1_000 }),
+    clientOptions: { maxItemsPerWindow: 50 },
+  });
+  let writes = 0;
+  const files = filesIn(dir);
+  const store = proc.store as any;
+  const persist = store.persist.bind(store);
+  store.persist = (tasks: unknown) => { writes += 1; persist(tasks); };
+  for (let i = 1; i <= 100; i += 1) {
+    await proc.poll([inbound(i, `question ${i} ${'q'.repeat(2_000)}`)], `cursor-${i}`);
+    await proc.idle();
+  }
+  assert.equal(proc.adapterCalls.length, 100);
+  assert.ok(proc.tasks().every((task) => task.phase === 'completed'));
+  const size = statSync(files.tasksPath).size;
+  assert.ok(size < 150_000, `ledger is ${size} bytes`);
+  const [task] = proc.tasks();
+  assert.equal(task.outcome, undefined);
+  assert.ok(task.outputs?.every((output) => output.text === '' && (output.bytes ?? 0) > 0));
+  assert.ok(task.inbound.text.length <= 201);
+  // handoff, claim, running, outcome+outputs, enqueued, complete
+  assert.ok(writes / 100 <= 6, `${writes / 100} ledger writes per message`);
+});
+
+test('a runner error after the agent started gets an accurate recovery notice', async () => {
+  const dir = freshDir();
+  const proc = boot(dir, { bootId: 'boot-1' });
+  const router = proc.router as any;
+  const exec = router.exec.bind(router);
+  router.exec = async (...args: any[]) => {
+    const run = args[5];
+    run.store.markRunning(run.taskId, 'boot-1', 'codex');
+    throw new Error('boom');
+  };
+  await proc.poll([inbound(1)], 'cursor-1');
+  await proc.idle();
+  router.exec = exec;
+  const [task] = proc.tasks();
+  assert.equal(task.phase, 'recovery-required');
+  assert.equal(task.recovery?.reason, 'runner-error');
+  assert.match(proc.delivered.at(-1) || '', /^⚠️ 处理你的消息时桥接服务内部出错，codex 可能已开始执行/);
+  assert.equal(proc.adapterCalls.length, 0);
 });

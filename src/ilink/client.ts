@@ -557,7 +557,7 @@ export class ILinkClient {
      * the same output after a restart is idempotent while it is still queued.
      */
     itemIdPrefix?: string;
-    /** Invoked synchronously once the outbox durably holds every chunk, before any send. */
+    /** Invoked synchronously once the outbox durably holds every chunk, before any send. Errors are logged, not thrown. */
     onEnqueued?: (items: OutboxItem[]) => void;
   }): Promise<SendResult[]> {
     const streamType = options?.streamType || 'regular';
@@ -576,7 +576,12 @@ export class ILinkClient {
           text: chunk,
           ...(prefix ? { itemId: `${prefix}#${index}`, clientId: stableClientId(`${prefix}#${index}`) } : {}),
         })));
-      options?.onEnqueued?.(items);
+      try {
+        options?.onEnqueued?.(items);
+      } catch (error) {
+        // Bookkeeping must never block delivery of what the outbox already holds.
+        log.error('[delivery] onEnqueued 回调失败:', error);
+      }
       for (const item of items) {
         this.diagnostics.record({
           event: 'queue-enqueue',
