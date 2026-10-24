@@ -6,56 +6,90 @@ import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { ChildProcess, SpawnOptions } from 'node:child_process';
-import type { Options, SDKUserMessage } from '@anthropic-ai/claude-agent-sdk';
 
 import { DEFAULT_SETTINGS, type IntermediateMessage, type UserSettings } from '../src/adapters/base.js';
-import { ClaudeAdapter, type ClaudeQuery, type ClaudeSpawn } from '../src/adapters/claude.js';
-
-type Params = { prompt: string | AsyncIterable<SDKUserMessage>; options?: Options };
-type Script = (params: Params) => AsyncGenerator<any>;
+import { ClaudeAdapter, type ClaudeSpawn } from '../src/adapters/claude.js';
 
 const SID = 'sess-1';
 
-function fakeQuery(script: Script) {
-  const calls: Params[] = [];
-  const query = ((params: Params) => { calls.push(params); return script(params); }) as unknown as ClaudeQuery;
-  return { query, calls, load: async () => query };
-}
+/** A scripted stand-in for `claude -p --input-format stream-json …`: records every JSON line
+ *  written to stdin, lets the script emit stdout lines, and exits when stdin is closed. */
+class FakeClaude {
+  readonly child: ChildProcess;
+  readonly written: any[] = [];
+  stdinEnded = false;
+  killedWith?: string;
+  private readonly stdout = new PassThrough();
+  private readonly stderr = new PassThrough();
+  private waiters: Array<{ pred: (m: any) => boolean; resolve: (m: any) => void }> = [];
+  private buf = '';
+  private exited = false;
 
-interface SpawnCapture { command?: string; args?: string[]; options?: SpawnOptions; stdin: string; count: number }
-
-function fakeSpawn(stdoutText: string, closeCode = 0): { spawn: ClaudeSpawn; capture: SpawnCapture } {
-  const capture: SpawnCapture = { stdin: '', count: 0 };
-  const spawn = ((command: string, args: string[], options: SpawnOptions) => {
-    capture.count++;
-    capture.command = command;
-    capture.args = [...args];
-    capture.options = options;
+  constructor() {
     const child = new EventEmitter() as unknown as ChildProcess;
     const stdin = new PassThrough();
-    const stdout = new PassThrough();
-    const stderr = new PassThrough();
     stdin.setEncoding('utf8');
-    stdin.on('data', (chunk: string) => { capture.stdin += chunk; });
-    Object.assign(child, { stdin, stdout, stderr, killed: false, exitCode: null, pid: 4242, kill: () => true });
-    queueMicrotask(() => {
-      stdout.end(stdoutText);
-      stderr.end();
-      Object.assign(child, { exitCode: closeCode });
-      child.emit('close', closeCode, null);
+    stdin.on('data', (chunk: string) => {
+      this.buf += chunk;
+      let nl: number;
+      while ((nl = this.buf.indexOf('\n')) >= 0) {
+        const line = this.buf.slice(0, nl);
+        this.buf = this.buf.slice(nl + 1);
+        const msg = JSON.parse(line);
+        this.written.push(msg);
+        const i = this.waiters.findIndex((w) => w.pred(msg));
+        if (i >= 0) this.waiters.splice(i, 1)[0].resolve(msg);
+      }
     });
-    return child;
+    // Like the real CLI: closing stdin after the result lets the process exit.
+    stdin.on('end', () => { this.stdinEnded = true; this.exit(0); });
+    Object.assign(child, {
+      stdin, stdout: this.stdout, stderr: this.stderr, killed: false, exitCode: null, pid: 4242,
+      kill: (sig: string) => { this.killedWith = sig; Object.assign(child, { killed: true }); this.exit(null, sig); return true; },
+    });
+    this.child = child;
+  }
+
+  /** Resolves with the next (or an already written) stdin message matching `pred`. */
+  next(pred: (m: any) => boolean): Promise<any> {
+    const seen = this.written.find(pred);
+    if (seen) return Promise.resolve(seen);
+    return new Promise((resolve) => this.waiters.push({ pred, resolve }));
+  }
+  userMessage(): Promise<any> { return this.next((m) => m.type === 'user'); }
+  emit(...msgs: any[]): void { for (const m of msgs) this.stdout.write(JSON.stringify(m) + '\n'); }
+  writeStderr(text: string): void { this.stderr.write(text); }
+  exit(code: number | null, signal: string | null = null): void {
+    if (this.exited) return;
+    this.exited = true;
+    this.stdout.end();
+    this.stderr.end();
+    setImmediate(() => {
+      Object.assign(this.child, { exitCode: code });
+      this.child.emit('close', code, signal);
+    });
+  }
+}
+
+function fakeSpawn(script: (p: FakeClaude) => void | Promise<void>) {
+  const calls: Array<{ command: string; args: string[]; options: SpawnOptions; proc: FakeClaude }> = [];
+  const spawn = ((command: string, args: string[], options: SpawnOptions) => {
+    const proc = new FakeClaude();
+    calls.push({ command, args: [...args], options, proc });
+    queueMicrotask(() => { void script(proc); });
+    return proc.child;
   }) as unknown as ClaudeSpawn;
-  return { spawn, capture };
+  return { spawn, calls };
 }
 
 function settings(over: Partial<UserSettings> = {}): UserSettings {
   return { ...DEFAULT_SETTINGS, msgMode: 'normal', sessionIds: {}, ...over };
 }
 
-const init = (permissionMode = 'auto') => ({ type: 'system', subtype: 'init', session_id: SID, permissionMode });
+const init = { type: 'system', subtype: 'init', session_id: SID, model: 'm', permissionMode: 'default' };
 const success = (result: string, extra: Record<string, unknown> = {}) => ({
-  type: 'result', subtype: 'success', is_error: false, result, session_id: SID, total_cost_usd: 0.0123, ...extra,
+  type: 'result', subtype: 'success', is_error: false, result, session_id: SID, total_cost_usd: 0.0123,
+  usage: { input_tokens: 10, output_tokens: 3, cache_read_input_tokens: 100, cache_creation_input_tokens: 7 }, ...extra,
 });
 const assistant = (content: unknown[], parent: string | null = null) => ({
   type: 'assistant', parent_tool_use_id: parent, session_id: SID, message: { role: 'assistant', content },
@@ -63,67 +97,80 @@ const assistant = (content: unknown[], parent: string | null = null) => ({
 const toolResults = (content: unknown[], parent: string | null = null) => ({
   type: 'user', parent_tool_use_id: parent, session_id: SID, message: { role: 'user', content },
 });
+const canUseTool = (requestId: string, toolName: string, input: Record<string, unknown>) => ({
+  type: 'control_request', request_id: requestId,
+  request: { subtype: 'can_use_tool', tool_name: toolName, input, tool_use_id: `tu_${requestId}`, permission_suggestions: [] },
+});
+const responseTo = (id: string) => (m: any) => m.type === 'control_response' && m.response?.request_id === id;
 
-const CLI_STDOUT = [
-  { type: 'assistant', message: { content: [{ type: 'text', text: 'cli answer' }] } },
-  { type: 'result', subtype: 'success', is_error: false, result: 'cli answer', session_id: 'cli-sess', duration_ms: 5, total_cost_usd: 0.5 },
-].map((o) => JSON.stringify(o)).join('\n');
-
-test('SDK path maps options, session id, cost, and tool_use_id pairing; skips subagent internals', async () => {
-  const fake = fakeQuery(async function* () {
-    yield init();
-    yield assistant([
-      { type: 'thinking', thinking: 'hmm' },
-      { type: 'tool_use', id: 'tu_bash', name: 'Bash', input: { command: 'false' } },
-      { type: 'tool_use', id: 'tu_agent', name: 'Agent', input: { subagent_type: 'Explore', description: 'look around' } },
-    ]);
-    // Subagent internals: neither the tool call nor its result may reach WeChat.
-    yield assistant([{ type: 'tool_use', id: 'tu_sub', name: 'Read', input: { file_path: '/x/secret.txt' } }], 'tu_agent');
-    yield toolResults([{ type: 'tool_result', tool_use_id: 'tu_sub', content: 'secret' }], 'tu_agent');
-    yield { type: 'system', subtype: 'task_started', task_id: 't1', tool_use_id: 'tu_agent', description: 'look around', session_id: SID };
-    yield { type: 'tool_progress', tool_use_id: 'tu_agent', tool_name: 'Agent', parent_tool_use_id: null, elapsed_time_seconds: 3, session_id: SID };
-    yield { type: 'system', subtype: 'task_progress', task_id: 't1', description: 'x', usage: {}, session_id: SID };
-    // Results arrive in the opposite order of the calls: pairing must follow tool_use_id.
-    yield toolResults([{ type: 'tool_result', tool_use_id: 'tu_agent', content: 'Agent completed with no output' }]);
-    yield toolResults([{ type: 'tool_result', tool_use_id: 'tu_bash', content: 'Exit code 1' }]);
-    yield assistant([{ type: 'text', text: 'done' }]);
-    yield success('final');
+test('argv, stdin user message, JSONL parsing, tool_use_id pairing, subagent filtering, cost and usage', async () => {
+  const fake = fakeSpawn(async (p) => {
+    await p.userMessage();
+    p.emit(
+      init,
+      { type: 'keep_alive' },
+      assistant([
+        { type: 'thinking', thinking: 'hmm' },
+        { type: 'tool_use', id: 'tu_bash', name: 'Bash', input: { command: 'false' } },
+        { type: 'tool_use', id: 'tu_agent', name: 'Agent', input: { subagent_type: 'Explore', description: 'look around' } },
+      ]),
+      // Subagent internals: neither the tool call nor its result may reach WeChat.
+      assistant([{ type: 'tool_use', id: 'tu_sub', name: 'Read', input: { file_path: '/x/secret.txt' } }], 'tu_agent'),
+      toolResults([{ type: 'tool_result', tool_use_id: 'tu_sub', content: 'secret' }], 'tu_agent'),
+      { type: 'system', subtype: 'task_started', task_id: 't1', tool_use_id: 'tu_agent', description: 'look around', session_id: SID },
+      { type: 'tool_progress', tool_use_id: 'tu_agent', tool_name: 'Agent', parent_tool_use_id: null, elapsed_time_seconds: 3, session_id: SID },
+      { type: 'system', subtype: 'task_progress', task_id: 't1', description: 'x', usage: {}, session_id: SID },
+      // Results arrive in the opposite order of the calls: pairing must follow tool_use_id.
+      toolResults([{ type: 'tool_result', tool_use_id: 'tu_agent', content: 'Agent completed with no output' }]),
+      toolResults([{ type: 'tool_result', tool_use_id: 'tu_bash', content: 'Exit code 1' }]),
+      assistant([{ type: 'text', text: 'done' }]),
+      success('final'),
+    );
   });
-  const spawn = fakeSpawn(CLI_STDOUT);
   const activity: IntermediateMessage[] = [];
-  const adapter = new ClaudeAdapter(fake.load, spawn.spawn);
+  const adapter = new ClaudeAdapter(fake.spawn);
 
   const result = await adapter.execute('hi', {
     settings: settings({
-      mode: 'auto', effort: 'xhigh', model: 'opus', maxTurns: 7, maxBudget: 2,
-      allowedTools: 'Read, Bash', disallowedTools: 'WebFetch,  Write', addDir: '/extra',
+      mode: 'safe', effort: 'xhigh', model: 'opus', maxTurns: 7, maxBudget: 2,
+      allowedTools: 'Read,Bash', disallowedTools: 'WebFetch', addDir: '/extra',
       systemPrompt: 'be brief', workDir: '/work', sessionIds: { claude: 'old-sess' },
     }),
+    extraArgs: ['--fixture-extra'],
     onIntermediate: (m) => activity.push(m),
   });
 
-  assert.equal(spawn.capture.count, 0);
   assert.equal(fake.calls.length, 1);
-  const { prompt, options } = fake.calls[0];
-  assert.equal(prompt, 'hi');
-  assert.equal(options?.permissionMode, 'auto');
-  assert.equal(options?.allowDangerouslySkipPermissions, undefined);
-  assert.equal(options?.maxTurns, 7);
-  assert.equal(options?.effort, 'xhigh');
-  assert.equal(options?.model, 'opus');
-  assert.equal(options?.maxBudgetUsd, 2);
-  assert.deepEqual(options?.allowedTools, ['Read', 'Bash']);
-  assert.deepEqual(options?.disallowedTools, ['WebFetch', 'Write']);
-  assert.deepEqual(options?.additionalDirectories, ['/extra']);
-  assert.deepEqual(options?.systemPrompt, { type: 'preset', preset: 'claude_code', append: 'be brief' });
-  assert.equal(options?.resume, 'old-sess');
-  assert.equal(options?.cwd, '/work');
-  assert.equal(typeof options?.canUseTool, 'function');
+  const { command, args, options, proc } = fake.calls[0];
+  assert.equal(command, 'claude');
+  assert.deepEqual(args, [
+    '-p', '--input-format', 'stream-json', '--output-format', 'stream-json', '--verbose',
+    '--permission-prompt-tool', 'stdio',
+    '--permission-mode', 'default',
+    '--max-turns', '7',
+    '--effort', 'xhigh',
+    '--model', 'opus',
+    '--max-budget-usd', '2',
+    '--allowedTools', 'Read,Bash',
+    '--disallowedTools', 'WebFetch',
+    '--append-system-prompt', 'be brief',
+    '--add-dir', '/extra',
+    '--resume', 'old-sess',
+    '--fixture-extra',
+  ]);
+  assert.equal(options.cwd, '/work');
+  assert.deepEqual(proc.written[0], { type: 'control_request', request_id: 'wx_init_1', request: { subtype: 'initialize' } });
+  assert.deepEqual(proc.written[1], {
+    type: 'user', session_id: '', parent_tool_use_id: null,
+    message: { role: 'user', content: [{ type: 'text', text: 'hi' }] },
+  });
+  assert.equal(proc.stdinEnded, true, 'stdin is closed after the result so the CLI exits');
 
   assert.equal(result.text, 'final');
   assert.equal(result.thinking, 'hmm');
   assert.equal(result.sessionId, SID);
   assert.equal(result.cost, 0.0123);
+  assert.deepEqual(result.usage, { inputTokens: 10, outputTokens: 3, cacheReadTokens: 100, cacheWriteTokens: 7 });
   assert.equal(result.error, false);
   assert.deepEqual(activity, [
     { type: 'thinking', content: 'hmm' },
@@ -135,105 +182,88 @@ test('SDK path maps options, session id, cost, and tool_use_id pairing; skips su
   ]);
 });
 
-test('SDK error thrown after a result does not re-run the task via the CLI', async () => {
-  const fake = fakeQuery(async function* () {
-    yield init();
-    yield { type: 'result', subtype: 'error_max_turns', is_error: true, session_id: SID, total_cost_usd: 0.2, errors: [] };
-    throw new Error('Claude Code process exited with code 1');
-  });
-  const spawn = fakeSpawn(CLI_STDOUT);
-  const adapter = new ClaudeAdapter(fake.load, spawn.spawn);
-
-  const result = await adapter.execute('hi', { settings: settings({ maxTurns: 3 }) });
-
-  assert.equal(spawn.capture.count, 0);
-  assert.equal(result.error, true);
-  assert.equal(result.sessionId, SID);
-  assert.equal(result.cost, 0.2);
-  assert.match(result.text, /最大轮数（3）/);
-});
-
-test('SDK failure after the first message returns an error instead of falling back', async () => {
-  const fake = fakeQuery(async function* () {
-    yield init();
-    yield assistant([{ type: 'tool_use', id: 'tu1', name: 'Write', input: { file_path: '/a.txt' } }]);
-    throw new Error('stream broke');
-  });
-  const spawn = fakeSpawn(CLI_STDOUT);
-  const adapter = new ClaudeAdapter(fake.load, spawn.spawn);
-
-  const result = await adapter.execute('hi', { settings: settings() });
-
-  assert.equal(spawn.capture.count, 0);
-  assert.equal(result.error, true);
-  assert.equal(result.sessionId, SID, 'session id from init survives the failure');
-  assert.match(result.text, /stream broke/);
-});
-
-test('SDK that cannot start falls back to the CLI with corrected argv', async () => {
-  const cases: Array<{ name: string; load: () => Promise<ClaudeQuery> }> = [
-    { name: 'import failure', load: async () => { throw new Error('Cannot find package'); } },
-    { name: 'throws before first message', load: fakeQuery(async function* () { throw new Error('spawn ENOENT'); }).load },
-  ];
-  for (const c of cases) {
-    for (const [mode, permissionMode] of [['auto', 'auto'], ['safe', 'default'], ['plan', 'plan']] as const) {
-      const spawn = fakeSpawn(CLI_STDOUT);
-      const adapter = new ClaudeAdapter(c.load, spawn.spawn);
-      const result = await adapter.execute('hello', {
-        settings: settings({ mode, maxTurns: 9, effort: 'high', disallowedTools: 'Write', addDir: '/extra', workDir: '/work', sessionIds: { claude: 'old' } }),
-      });
-      assert.equal(spawn.capture.count, 1, c.name);
-      assert.equal(spawn.capture.command, 'claude');
-      assert.deepEqual(spawn.capture.args, [
-        '-p', '--output-format', 'stream-json', '--verbose',
-        '--permission-mode', permissionMode,
-        '--max-turns', '9',
-        '--effort', 'high',
-        '--disallowedTools', 'Write',
-        '--add-dir', '/extra',
-        '--resume', 'old',
-      ], `${c.name} / ${mode}`);
-      assert.equal(spawn.capture.options?.cwd, '/work');
-      assert.equal(spawn.capture.stdin, 'hello');
-      assert.deepEqual(result, { text: 'cli answer', thinking: undefined, sessionId: 'cli-sess', cost: 0.5, duration: 5, error: false, sessionExpired: false });
-    }
+test('permission flags per mode', async () => {
+  for (const [mode, flags] of [
+    ['auto', ['--dangerously-skip-permissions']],
+    ['safe', ['--permission-mode', 'default']],
+    ['plan', ['--permission-mode', 'plan']],
+  ] as const) {
+    const fake = fakeSpawn(async (p) => { await p.userMessage(); p.emit(init, success('ok')); });
+    await new ClaudeAdapter(fake.spawn).execute('x', { settings: settings({ mode, maxTurns: 0, effort: '' }) });
+    assert.deepEqual(fake.calls[0].args.slice(8), flags, mode);
   }
 });
 
-test('safe and plan modes deny non-question tools with a readable reason; AskUserQuestion still asks', async () => {
-  for (const [mode, permissionMode] of [['safe', 'default'], ['plan', 'plan'], ['auto', 'auto']] as const) {
-    const decisions: any[] = [];
+test('can_use_tool: safe/plan deny with a reason, auto allows, AskUserQuestion round-trips via askUser', async () => {
+  for (const mode of ['safe', 'plan', 'auto'] as const) {
+    const responses: any[] = [];
     let asked: any;
-    const fake = fakeQuery(async function* (params) {
-      yield init(permissionMode);
-      const ctx = { signal: new AbortController().signal, toolUseID: 'tu' };
-      decisions.push(await params.options!.canUseTool!('Bash', { command: 'rm -rf build' }, ctx));
-      decisions.push(await params.options!.canUseTool!('ExitPlanMode', { plan: 'p' }, ctx));
-      decisions.push(await params.options!.canUseTool!('AskUserQuestion', { questions: [{ question: 'Q?', options: [{ label: 'A' }] }] }, ctx));
-      yield success('ok');
+    const fake = fakeSpawn(async (p) => {
+      await p.userMessage();
+      p.emit(init);
+      p.emit(canUseTool('r1', 'Write', { file_path: '/a.txt', content: 'x' }));
+      responses.push(await p.next(responseTo('r1')));
+      p.emit(canUseTool('r2', 'ExitPlanMode', { plan: 'p' }));
+      responses.push(await p.next(responseTo('r2')));
+      p.emit(canUseTool('r3', 'AskUserQuestion', { questions: [{ question: 'Q?', options: [{ label: 'A' }] }] }));
+      responses.push(await p.next(responseTo('r3')));
+      p.emit(success('ok'));
     });
-    const adapter = new ClaudeAdapter(fake.load, fakeSpawn(CLI_STDOUT).spawn);
-    const result = await adapter.execute('hi', {
+    const result = await new ClaudeAdapter(fake.spawn).execute('hi', {
       settings: settings({ mode }),
       askUser: async (req) => { asked = req; return { 'Q?': 'A' }; },
     });
-
-    assert.equal(fake.calls[0].options?.permissionMode, permissionMode);
     assert.equal(result.text, 'ok');
-    assert.equal(decisions[0].behavior, 'deny', mode);
-    assert.ok(decisions[0].message.includes(mode) && decisions[0].message.includes('Bash'), decisions[0].message);
-    if (mode === 'safe') assert.match(decisions[0].message, /微信内审批将在后续版本支持；可用 \/mode auto/);
-    assert.equal(decisions[1].behavior, 'deny');
-    if (mode === 'plan') assert.match(decisions[1].message, /完整计划/);
+
+    const [write, exitPlan, question] = responses.map((r) => r.response);
+    assert.equal(write.subtype, 'success');
+    if (mode === 'auto') {
+      assert.deepEqual(write.response, { behavior: 'allow', updatedInput: { file_path: '/a.txt', content: 'x' }, toolUseID: 'tu_r1' });
+    } else {
+      assert.equal(write.response.behavior, 'deny', mode);
+      assert.equal(write.response.toolUseID, 'tu_r1');
+      assert.ok(write.response.message.includes(mode) && write.response.message.includes('Write'), write.response.message);
+      assert.equal(exitPlan.response.behavior, 'deny');
+    }
+    if (mode === 'safe') assert.match(write.response.message, /微信内审批将在后续版本支持；可用 \/mode auto/);
+    if (mode === 'plan') assert.match(exitPlan.response.message, /完整计划/);
     assert.deepEqual(asked, { questions: [{ question: 'Q?', options: [{ label: 'A' }] }] });
-    assert.deepEqual(decisions[2], {
-      behavior: 'allow',
-      updatedInput: { questions: [{ question: 'Q?', options: [{ label: 'A' }] }], answers: { 'Q?': 'A' } },
+    assert.deepEqual(responses[2], {
+      type: 'control_response',
+      response: {
+        subtype: 'success', request_id: 'r3',
+        response: {
+          behavior: 'allow',
+          updatedInput: { questions: [{ question: 'Q?', options: [{ label: 'A' }] }], answers: { 'Q?': 'A' } },
+          toolUseID: 'tu_r3',
+        },
+      },
     });
+    void question;
   }
 });
 
-test('images are sent natively as base64 blocks via a one-message streaming prompt', async () => {
+test('unsupported control requests get an error response; cancelled permission asks are not answered', async () => {
+  let resolveAsk!: (v: Record<string, string>) => void;
+  const fake = fakeSpawn(async (p) => {
+    await p.userMessage();
+    p.emit(init, { type: 'control_request', request_id: 'h1', request: { subtype: 'hook_callback', callback_id: 'x' } });
+    await p.next(responseTo('h1'));
+    p.emit(canUseTool('q1', 'AskUserQuestion', { questions: [] }), { type: 'control_cancel_request', request_id: 'q1' });
+    setTimeout(() => { resolveAsk({}); setTimeout(() => p.emit(success('ok')), 5); }, 5);
+  });
+  await new ClaudeAdapter(fake.spawn).execute('hi', {
+    settings: settings(),
+    askUser: () => new Promise((resolve) => { resolveAsk = resolve; }),
+  });
+  const written = fake.calls[0].proc.written;
+  assert.deepEqual(written.find(responseTo('h1')), {
+    type: 'control_response', response: { subtype: 'error', request_id: 'h1', error: 'unsupported control request: hook_callback' },
+  });
+  assert.equal(written.find(responseTo('q1')), undefined);
+});
+
+test('images are sent natively as base64 blocks in the stdin user message', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'claude-adapter-'));
   try {
     const png = Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), Buffer.from('fake-png-body')]);
@@ -244,15 +274,8 @@ test('images are sent natively as base64 blocks via a one-message streaming prom
     const docPath = join(dir, 'notes.txt');
     writeFileSync(docPath, 'hello');
 
-    const sent: SDKUserMessage[] = [];
-    const fake = fakeQuery(async function* (params) {
-      assert.notEqual(typeof params.prompt, 'string');
-      for await (const m of params.prompt as AsyncIterable<SDKUserMessage>) sent.push(m);
-      yield init();
-      yield success('saw it');
-    });
-    const adapter = new ClaudeAdapter(fake.load, fakeSpawn(CLI_STDOUT).spawn);
-    const result = await adapter.execute('what is this', {
+    const fake = fakeSpawn(async (p) => { await p.userMessage(); p.emit(init, success('saw it')); });
+    const result = await new ClaudeAdapter(fake.spawn).execute('what is this', {
       settings: settings(),
       media: [
         { type: 'image', path: pngPath, fileName: 'photo.dat' },
@@ -262,10 +285,9 @@ test('images are sent natively as base64 blocks via a one-message streaming prom
     });
 
     assert.equal(result.text, 'saw it');
-    assert.equal(sent.length, 1, 'input stream ends after one message');
-    assert.equal(sent[0].type, 'user');
-    assert.equal(sent[0].parent_tool_use_id, null);
-    const content = sent[0].message.content as any[];
+    const users = fake.calls[0].proc.written.filter((m) => m.type === 'user');
+    assert.equal(users.length, 1, 'exactly one user turn per execute');
+    const content = users[0].message.content;
     assert.equal(content.length, 2);
     assert.deepEqual(content[0], { type: 'image', source: { type: 'base64', media_type: 'image/png', data: png.toString('base64') } });
     assert.equal(content[1].type, 'text');
@@ -278,47 +300,82 @@ test('images are sent natively as base64 blocks via a one-message streaming prom
   }
 });
 
-test('text-only prompts stay a plain string', async () => {
-  const fake = fakeQuery(async function* () { yield init(); yield success('ok'); });
-  const adapter = new ClaudeAdapter(fake.load, fakeSpawn(CLI_STDOUT).spawn);
-  await adapter.execute('plain', { settings: settings({ msgMode: 'compact' }) });
-  assert.equal(fake.calls[0].prompt, 'plain');
-});
-
-test('cancel and idle timeout return the early session id without falling back', async () => {
-  // Cancel: the caller aborts while the SDK is mid-run.
+test('cancel sends an interrupt control request and keeps the early session id', async () => {
   const ac = new AbortController();
-  const cancelFake = fakeQuery(async function* (params) {
-    yield init();
-    ac.abort();
-    if (params.options!.abortController!.signal.aborted) throw new Error('aborted');
-    yield success('never');
+  const fake = fakeSpawn(async (p) => {
+    await p.userMessage();
+    p.emit(init);
+    setTimeout(() => ac.abort(), 5);
+    await p.next((m) => m.type === 'control_request' && m.request?.subtype === 'interrupt');
+    p.emit({ type: 'result', subtype: 'error_during_execution', is_error: true, session_id: SID, total_cost_usd: 0.01, errors: [] });
   });
-  const spawn = fakeSpawn(CLI_STDOUT);
-  const cancelled = await new ClaudeAdapter(cancelFake.load, spawn.spawn).execute('hi', { settings: settings(), signal: ac.signal });
-  assert.deepEqual(cancelled, { text: '已取消', sessionId: SID, error: true });
-
-  // Idle timeout: the SDK goes silent after init until our abort fires.
-  const idleFake = fakeQuery(async function* (params) {
-    yield init();
-    const signal = params.options!.abortController!.signal;
-    await new Promise((resolve) => signal.addEventListener('abort', resolve, { once: true }));
-    throw new Error('aborted');
-  });
-  const timedOut = await new ClaudeAdapter(idleFake.load, spawn.spawn).execute('hi', { settings: settings(), timeout: 20 });
-  assert.equal(timedOut.error, true);
-  assert.equal(timedOut.sessionId, SID);
-  assert.match(timedOut.text, /执行超时/);
-  assert.equal(spawn.capture.count, 0);
+  const result = await new ClaudeAdapter(fake.spawn).execute('hi', { settings: settings(), signal: ac.signal });
+  assert.equal(fake.calls.length, 1);
+  assert.equal(fake.calls[0].proc.killedWith, undefined, 'graceful interrupt, no kill');
+  assert.deepEqual(result, { text: '已取消', sessionId: SID, cost: 0.01, duration: result.duration, error: true });
 });
 
-test('error result on a resumed session is flagged as expired', async () => {
-  const fake = fakeQuery(async function* () {
-    yield { type: 'result', subtype: 'error_during_execution', is_error: true, session_id: SID, total_cost_usd: 0, errors: ['No conversation found with session ID: old'] };
+test('a CLI that ignores the interrupt is killed after the grace period', async () => {
+  const ac = new AbortController();
+  const fake = fakeSpawn(async (p) => { await p.userMessage(); p.emit(init); setTimeout(() => ac.abort(), 5); });
+  const result = await new ClaudeAdapter(fake.spawn, 20).execute('hi', { settings: settings(), signal: ac.signal });
+  assert.equal(fake.calls[0].proc.killedWith, 'SIGTERM');
+  assert.equal(result.text, '已取消');
+  assert.equal(result.sessionId, SID);
+});
+
+test('idle timeout interrupts a silent run; heartbeats keep it alive', async () => {
+  const fake = fakeSpawn(async (p) => {
+    await p.userMessage();
+    p.emit(init);
+    // Heartbeats every 10 ms for 60 ms outlast a 30 ms idle timeout.
+    for (let i = 0; i < 6; i++) {
+      await new Promise((r) => setTimeout(r, 10));
+      p.emit({ type: 'tool_progress', tool_use_id: 't', tool_name: 'Bash', parent_tool_use_id: null, elapsed_time_seconds: i, session_id: SID });
+    }
+    assert.equal(p.written.some((m) => m.request?.subtype === 'interrupt'), false, 'no interrupt while heartbeats flow');
+    await p.next((m) => m.request?.subtype === 'interrupt');
+    p.exit(0);
   });
-  const adapter = new ClaudeAdapter(fake.load, fakeSpawn(CLI_STDOUT).spawn);
-  const result = await adapter.execute('hi', { settings: settings({ sessionIds: { claude: 'old' } }) });
+  const result = await new ClaudeAdapter(fake.spawn).execute('hi', { settings: settings(), timeout: 30 });
+  assert.equal(result.error, true);
+  assert.equal(result.sessionId, SID);
+  assert.match(result.text, /执行超时/);
+});
+
+test('process exiting without a result is reported once, without re-running', async () => {
+  const fake = fakeSpawn(async (p) => { await p.userMessage(); p.emit(init); p.writeStderr('boom: something broke'); p.exit(1); });
+  const result = await new ClaudeAdapter(fake.spawn).execute('hi', { settings: settings() });
+  assert.equal(fake.calls.length, 1);
+  assert.equal(result.error, true);
+  assert.equal(result.sessionId, SID);
+  assert.match(result.text, /异常退出（code 1）：boom/);
+  assert.equal(result.sessionExpired, false);
+});
+
+test('stale --resume id is flagged as expired', async () => {
+  const fake = fakeSpawn(async (p) => { await p.userMessage(); p.writeStderr('No conversation found with session ID: old\n'); p.exit(1); });
+  const result = await new ClaudeAdapter(fake.spawn).execute('hi', { settings: settings({ sessionIds: { claude: 'old' } }) });
   assert.equal(result.error, true);
   assert.equal(result.sessionExpired, true);
-  assert.match(result.text, /No conversation found/);
+});
+
+test('error results get readable text; spawn errors are reported', async () => {
+  const fake = fakeSpawn(async (p) => {
+    await p.userMessage();
+    p.emit(init, { type: 'result', subtype: 'error_max_turns', is_error: true, session_id: SID, total_cost_usd: 0.2, errors: [] });
+  });
+  const result = await new ClaudeAdapter(fake.spawn).execute('hi', { settings: settings({ maxTurns: 3 }) });
+  assert.equal(result.error, true);
+  assert.equal(result.cost, 0.2);
+  assert.match(result.text, /最大轮数（3）/);
+
+  const enoent = ((() => {
+    const child = new EventEmitter() as unknown as ChildProcess;
+    Object.assign(child, { stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough() });
+    setImmediate(() => child.emit('error', new Error('spawn claude ENOENT')));
+    return child;
+  }) as unknown) as ClaudeSpawn;
+  const failed = await new ClaudeAdapter(enoent).execute('hi', { settings: settings() });
+  assert.deepEqual(failed, { text: '无法启动: spawn claude ENOENT', error: true });
 });

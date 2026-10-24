@@ -1,39 +1,98 @@
 import { readFileSync } from 'node:fs';
-import type { CanUseTool, Options, PermissionMode, SDKMessage, SDKResultMessage, SDKUserMessage } from '@anthropic-ai/claude-agent-sdk';
 import { log } from '../utils/logger.js';
 import type { DownloadedMedia } from '../utils/media.js';
 import type { CLIAdapter, ExecOptions, ExecResult, AdapterCapabilities, ToolMode, UserSettings } from './base.js';
 import {
   commandExists,
   spawnCli,
-  setupAbort,
-  setupTimeout,
+  killProc,
   isSessionError,
   buildMediaPrompt,
-  collectUtf8,
-  writeStdin,
   summarizeToolUse,
   summarizeToolResult,
 } from './base.js';
 
-/** The slice of the SDK's `query()` this adapter uses. Injectable so tests can feed a
- *  scripted message stream without the real SDK or binary. */
-export type ClaudeQuery = (params: { prompt: string | AsyncIterable<SDKUserMessage>; options?: Options }) => AsyncIterable<SDKMessage>;
+// Claude Code is driven directly over its bidirectional stream-json protocol — the same one
+// @anthropic-ai/claude-agent-sdk speaks (wire formats below follow its 0.3.310 sdk.mjs):
+//   stdin  ← {type:'user', message, parent_tool_use_id:null, session_id:''}
+//            {type:'control_request', request_id, request:{subtype:'initialize'|'interrupt'}}
+//            {type:'control_response', response:{subtype:'success', request_id, response}}
+//   stdout → JSONL SDK messages (system/init, assistant, user, result, tool_progress, …)
+//            plus control_request {subtype:'can_use_tool'} because of --permission-prompt-tool stdio.
+// One execute() = one spawn; there is no second execution path to fall back to.
+
 export type ClaudeSpawn = typeof spawnCli;
 
-// Imported lazily: an SDK that fails to load (missing platform binary package, broken
-// install) must degrade to the CLI fallback instead of breaking the whole adapter module.
-const loadSdkQuery = async (): Promise<ClaudeQuery> => (await import('@anthropic-ai/claude-agent-sdk')).query;
-
-/** WeChat /mode → Claude permission mode, shared by the SDK and CLI paths. `auto` is Claude's
- *  classifier-approved mode (not bypassPermissions); `safe` is the standard prompting mode. */
-const PERMISSION_MODES: Record<ToolMode, PermissionMode> = { auto: 'auto', safe: 'default', plan: 'plan' };
+/** WeChat /mode → permission flags. `auto` is full bypass (the bridge's long-standing meaning);
+ *  `safe` is the standard prompting mode; `plan` is the CLI's read-only planning mode. */
+const PERMISSION_ARGS: Record<ToolMode, string[]> = {
+  auto: ['--dangerously-skip-permissions'],
+  safe: ['--permission-mode', 'default'],
+  plan: ['--permission-mode', 'plan'],
+};
 const EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'];
+// After an interrupt, give the CLI this long to wind the turn down before killing it.
+const INTERRUPT_GRACE_MS = 5000;
 
 type ImageMediaType = 'image/jpeg' | 'image/png' | 'image/gif' | 'image/webp';
 interface InlineImage { mediaType: ImageMediaType; data: string }
 // Anthropic API per-image limit; bigger images stay as a file path in the text prompt.
 const MAX_INLINE_IMAGE_BYTES = 5 * 1024 * 1024;
+
+/** A `can_use_tool` control request from the CLI (fields as sent on the wire). */
+export interface CanUseToolRequest {
+  subtype: 'can_use_tool';
+  tool_name: string;
+  input: Record<string, unknown>;
+  tool_use_id?: string;
+  /** Rules that would stop the CLI asking again this session ("always allow"). */
+  permission_suggestions?: unknown[];
+  title?: string;
+  description?: string;
+  decision_reason?: string;
+  [key: string]: unknown;
+}
+
+export type PermissionDecision =
+  | { behavior: 'allow'; updatedInput: Record<string, unknown>; updatedPermissions?: unknown[] }
+  | { behavior: 'deny'; message: string; interrupt?: boolean };
+
+/**
+ * The single decision point for every permission ask the CLI hands back to us — anything
+ * the permission mode did not settle itself. AskUserQuestion is answered through WeChat (the
+ * CLI routes it here in every mode, bypass included, because the tool requires user
+ * interaction). In auto (bypass) anything else that still asks is allowed, matching bypass.
+ * In safe/plan, in-WeChat approval (allow once / always allow this session via
+ * `permission_suggestions` → `updatedPermissions` / deny) plugs in here in a later PR; until
+ * then those asks are denied with a readable reason, never silently allowed. Plan mode stays
+ * read-only either way: the CLI enforces it and every write that asks is denied here.
+ */
+export async function decidePermission(
+  req: CanUseToolRequest,
+  ctx: { mode: ToolMode; askUser?: ExecOptions['askUser'] },
+): Promise<PermissionDecision> {
+  const input = req.input ?? {};
+  if (req.tool_name !== 'AskUserQuestion') {
+    if (ctx.mode === 'auto') return { behavior: 'allow', updatedInput: input };
+    return { behavior: 'deny', message: denyMessage(ctx.mode, req.tool_name) };
+  }
+  if (!ctx.askUser) return { behavior: 'deny', message: '当前无法向用户提问，请自行判断后继续' };
+  log.debug('[claude] AskUserQuestion input:', JSON.stringify(input, null, 2));
+  try {
+    const answers = await ctx.askUser({
+      questions: (input.questions as Array<{
+        question: string;
+        options: Array<{ label: string; description?: string }>;
+        multiSelect?: boolean;
+      }>) || [],
+    });
+    log.debug('[claude] AskUserQuestion answers:', JSON.stringify(answers));
+    return { behavior: 'allow', updatedInput: { ...input, answers } };
+  } catch (err) {
+    log.error('[claude] AskUserQuestion failed:', err);
+    return { behavior: 'deny', message: '用户未回复' };
+  }
+}
 
 export class ClaudeAdapter implements CLIAdapter {
   readonly name = 'claude';
@@ -45,355 +104,274 @@ export class ClaudeAdapter implements CLIAdapter {
   };
 
   constructor(
-    private readonly loadQuery: () => Promise<ClaudeQuery> = loadSdkQuery,
     private readonly spawnClaude: ClaudeSpawn = spawnCli,
+    private readonly interruptGraceMs = INTERRUPT_GRACE_MS,
   ) {}
 
   async isAvailable(): Promise<boolean> { return commandExists(this.command); }
 
-  async execute(prompt: string, opts: ExecOptions): Promise<ExecResult> {
-    const workDir = opts.settings.workDir || opts.workDir;
-    log.debug(`[claude] workDir: ${workDir}`);
-    if (opts.media && opts.media.length > 0) {
-      log.debug(`[claude] media paths: ${opts.media.map(m => m.path).join(', ')}`);
-    }
-
-    // executeWithSDK only throws when the SDK never got going (import failure, missing
-    // binary, crash before its first message). Once it has produced anything, tools may
-    // already have run, so it returns an error result instead — retrying via the CLI
-    // would execute the same task twice.
-    try {
-      return await this.executeWithSDK(prompt, opts, workDir);
-    } catch (sdkErr) {
-      log.warn(`[claude] Agent SDK failed to start, falling back to CLI: ${(sdkErr as Error).message}`);
-      return this.executeWithCLI(buildMediaPrompt(prompt, opts.media, workDir), opts);
-    }
-  }
-
-  // ─── Agent SDK path (supports AskUserQuestion) ────────
-
-  private async executeWithSDK(prompt: string, opts: ExecOptions, workDir: string | undefined): Promise<ExecResult> {
-    const query = await this.loadQuery();
+  execute(prompt: string, opts: ExecOptions): Promise<ExecResult> {
     const { settings } = opts;
-    const start = Date.now();
-    const msgMode = settings.msgMode || 'compact';
+    const workDir = settings.workDir || opts.workDir;
+    if (opts.signal?.aborted) return Promise.resolve({ text: '已取消', error: true });
 
-    const options: Options = {
-      maxTurns: settings.maxTurns,
-      permissionMode: PERMISSION_MODES[settings.mode] ?? 'default',
-      // Load all settings sources to get complete skills/commands list
-      settingSources: ['user', 'project', 'local'],
-    };
-
-    if (EFFORTS.includes(settings.effort)) options.effort = settings.effort as Options['effort'];
-    else if (settings.effort) log.warn(`[claude/sdk] 忽略无效 effort: ${settings.effort}`);
-    if (settings.model) options.model = settings.model;
-    if (settings.maxBudget > 0) options.maxBudgetUsd = settings.maxBudget;
-    // Append to Claude Code's default prompt (the preset form) rather than replacing it.
-    if (settings.systemPrompt) options.systemPrompt = { type: 'preset', preset: 'claude_code', append: settings.systemPrompt };
-    if (settings.allowedTools) options.allowedTools = splitList(settings.allowedTools);
-    if (settings.disallowedTools) options.disallowedTools = splitList(settings.disallowedTools);
-    if (settings.addDir) options.additionalDirectories = [settings.addDir];
-
-    // Session resume
+    const args = [
+      '-p', '--input-format', 'stream-json', '--output-format', 'stream-json', '--verbose',
+      '--permission-prompt-tool', 'stdio',
+      ...(PERMISSION_ARGS[settings.mode] ?? PERMISSION_ARGS.safe),
+    ];
+    if (settings.maxTurns > 0) args.push('--max-turns', String(settings.maxTurns));
+    if (EFFORTS.includes(settings.effort)) args.push('--effort', settings.effort);
+    else if (settings.effort) log.warn(`[claude] 忽略无效 effort: ${settings.effort}`);
+    if (settings.model) args.push('--model', settings.model);
+    if (settings.maxBudget > 0) args.push('--max-budget-usd', String(settings.maxBudget));
+    if (settings.allowedTools) args.push('--allowedTools', settings.allowedTools);
+    if (settings.disallowedTools) args.push('--disallowedTools', settings.disallowedTools);
+    if (settings.systemPrompt) args.push('--append-system-prompt', settings.systemPrompt);
+    if (settings.bare) args.push('--bare');
+    if (settings.addDir) args.push('--add-dir', settings.addDir);
+    if (settings.sessionName) args.push('--name', settings.sessionName);
     const sid = settings.sessionIds[this.name];
-    if (sid) options.resume = sid;
+    if (sid) args.push('--resume', sid);
+    if (opts.extraArgs) args.push(...opts.extraArgs);
 
-    // Working directory
-    if (workDir) options.cwd = workDir;
-
-    // Timeout + cancellation for the SDK path.
-    //
-    // The `opts.signal?.aborted` check inside the loop below only runs when a message
-    // arrives, so a query that produces nothing — e.g. a tool call blocked on an
-    // interactive prompt such as `sudo` waiting for a password — hangs the loop forever.
-    // The router keeps its per-user `active` lock for the whole call, so one stuck query
-    // silently wedges the bridge for that user until the process restarts (observed: 8h37m).
-    //
-    // The CLI fallback already bounds itself via setupTimeout(); mirror that here by
-    // driving the SDK's own AbortController from both the caller's signal and a timer.
-    //
-    // The timer measures IDLE time, not total duration: it is re-armed on every message
-    // (including tool_progress / task_progress heartbeats, which are otherwise not shown),
-    // so a long-but-healthy agent run is never cut off, while one that has stopped
-    // producing output is aborted after `timeout` of silence. A total-duration cap would
-    // be wrong here — unlike the other adapters, the SDK path is Claude's primary path
-    // (the CLI is only a fallback), so capping it at cliTimeout (1 h by default) would
-    // kill ordinary multi-step work. Idle is also what the message below promises.
-    const sdkAbort = new AbortController();
-    let abortTimer: ReturnType<typeof setTimeout> | null = null;
-    let finished = false;
-    const pauseIdleTimeout = (): void => {
-      if (abortTimer) clearTimeout(abortTimer);
-      abortTimer = null;
-    };
-    const armIdleTimeout = (): void => {
-      if (!opts.timeout || finished) return;
-      pauseIdleTimeout();
-      abortTimer = setTimeout(() => sdkAbort.abort(), opts.timeout);
-    };
-    const forwardAbort = () => sdkAbort.abort();
-    opts.signal?.addEventListener('abort', forwardAbort, { once: true });
-    options.abortController = sdkAbort;
-    // A signal that was already aborted before we subscribed never fires the listener.
-    if (opts.signal?.aborted) sdkAbort.abort();
-
-    // Always installed, so every permission ask gets an answer the model can relay.
-    // In-WeChat approval is not wired up yet, so anything the permission mode did not
-    // already auto-approve is denied with a readable reason. (Previously everything was
-    // allowed here, which made safe/plan behave like bypass.)
-    const { askUser } = opts;
-    const canUseTool: CanUseTool = async (toolName, input) => {
-      if (toolName !== 'AskUserQuestion') return { behavior: 'deny', message: denyMessage(settings.mode, toolName) };
-      if (!askUser) return { behavior: 'deny', message: '当前无法向用户提问，请自行判断后继续' };
-      log.debug('[claude] AskUserQuestion input:', JSON.stringify(input, null, 2));
-      // Waiting on the user is not the agent going idle.
-      pauseIdleTimeout();
-      try {
-        const answers = await askUser({
-          questions: (input.questions as Array<{
-            question: string;
-            options: Array<{ label: string; description?: string }>;
-            multiSelect?: boolean;
-          }>) || [],
-        });
-        log.debug('[claude] AskUserQuestion answers:', JSON.stringify(answers));
-        return { behavior: 'allow', updatedInput: { ...input, answers } };
-      } catch (err) {
-        log.error('[claude] AskUserQuestion failed:', err);
-        return { behavior: 'deny', message: '用户未回复' };
-      } finally {
-        armIdleTimeout();
-      }
-    };
-    options.canUseTool = canUseTool;
-
-    // Images go to Claude natively as base64 blocks (a plain string prompt cannot carry
-    // them); other files are still listed as paths in the text.
+    // Images go to Claude natively as base64 blocks; other files are listed as paths.
     const { images, others } = splitMedia(opts.media);
     const text = buildMediaPrompt(prompt, others, workDir);
-    const sdkPrompt = images.length > 0 ? singleUserMessage(text, images) : text;
 
-    armIdleTimeout();
-    log.debug(`[claude/sdk] effort=${settings.effort} mode=${settings.mode} msgMode=${msgMode} resume=${sid || 'none'} images=${images.length} timeout=${opts.timeout ?? 'none'}`);
+    log.debug(`[claude] workDir=${workDir} effort=${settings.effort} model=${settings.model || 'default'} mode=${settings.mode} resume=${sid || 'none'} images=${images.length} timeout=${opts.timeout ?? 'none'}`);
 
-    let resultText = '';
-    let thinking = '';
-    let sessionId: string | undefined;
-    let cost: number | undefined;
-    let error = false;
-    let received = false;
-    let resultSeen = false;
-
-    // Stream intermediate messages via callback
-    const { onIntermediate } = opts;
-    const streamIntermediate = msgMode !== 'compact' && onIntermediate;
-
-    // tool_use id → tool name, so parallel tool results are labelled with their own tool.
-    const toolNames = new Map<string, string>();
-
-    try {
-      for await (const msg of query({ prompt: sdkPrompt, options })) {
-        received = true;
-        if (opts.signal?.aborted) {
-          return { text: '已取消', sessionId, error: true };
-        }
-        armIdleTimeout();
-
-        if (msg.type === 'system' && msg.subtype === 'init') {
-          // Known before any work happens, so a cancelled/timed-out run can still be resumed.
-          sessionId = msg.session_id;
-          if (options.permissionMode !== msg.permissionMode) {
-            log.warn(`[claude/sdk] 请求权限模式 ${options.permissionMode}，实际为 ${msg.permissionMode}`);
-          }
-        }
-
-        // Messages from inside a subagent (parent_tool_use_id set) are not forwarded: the
-        // main thread's Agent/Task tool_use line and its tool_result already stand for it.
-        if (msg.type === 'assistant' && !msg.parent_tool_use_id) {
-          for (const block of msg.message.content) {
-            if (block.type === 'thinking' && block.thinking) {
-              thinking += block.thinking;
-              if (streamIntermediate) onIntermediate({ type: 'thinking', content: block.thinking });
-            }
-            if (block.type === 'text' && block.text) {
-              if (streamIntermediate && block.text.trim()) onIntermediate({ type: 'text', content: block.text });
-            }
-            if (block.type === 'tool_use') {
-              toolNames.set(block.id, block.name);
-              if (streamIntermediate) {
-                onIntermediate({ type: 'tool_use', content: summarizeToolUse(block.name || 'Tool', block.input), toolName: block.name });
-              }
-            }
-          }
-        }
-
-        if (msg.type === 'user' && !msg.parent_tool_use_id && Array.isArray(msg.message.content)) {
-          for (const block of msg.message.content) {
-            if (block.type !== 'tool_result') continue;
-            const toolName = toolNames.get(block.tool_use_id);
-            toolNames.delete(block.tool_use_id);
-            if (!streamIntermediate || !block.content) continue;
-            const summary = summarizeToolResult(toolName, block.content);
-            if (summary) onIntermediate({ type: 'tool_result', content: summary, toolName });
-          }
-        }
-
-        if (msg.type === 'result') {
-          resultSeen = true;
-          sessionId = msg.session_id || sessionId;
-          cost = msg.total_cost_usd;
-          if (msg.subtype === 'success') {
-            resultText = msg.result || '(无输出)';
-            error = msg.is_error;
-          } else {
-            resultText = describeResultError(msg, settings);
-            error = true;
-          }
-        }
-        // tool_progress, task_*, status, rate-limit and other events only keep the idle timer alive.
-      }
-    } catch (err) {
-      if (sdkAbort.signal.aborted) {
-        if (opts.signal?.aborted) return { text: '已取消', sessionId, error: true };
-        // Timed out: return a result rather than throwing, so execute() does NOT retry via
-        // the CLI path — that would make the user wait a second full timeout.
-        const mins = Math.round((opts.timeout ?? 0) / 60000);
-        log.warn(`[claude/sdk] 空闲超时 (${opts.timeout}ms 无消息)，已中止`);
-        return {
-          text: `执行超时（${mins} 分钟无响应），已自动中止。\n可能是某个命令在等待输入（如 sudo 密码）。`,
-          sessionId,
-          duration: Date.now() - start,
-          error: true,
-        };
-      }
-      // Nothing came out of the SDK: it never started, so the CLI fallback is safe.
-      if (!received) throw err;
-      // query() may throw right after yielding an error result; the result already says
-      // what happened. Otherwise report the failure — never re-run a task that started.
-      log.warn(`[claude/sdk] 执行中出错（不回退 CLI）: ${(err as Error).message}`);
-      if (!resultSeen) {
-        return { text: `Claude 执行出错：${(err as Error).message}`, sessionId, cost, duration: Date.now() - start, error: true };
-      }
-    } finally {
-      finished = true;
-      pauseIdleTimeout();
-      opts.signal?.removeEventListener('abort', forwardAbort);
-    }
-
-    if (!received) throw new Error('Agent SDK 未返回任何消息');
-
-    return {
-      text: resultText || '(无输出)',
-      thinking: thinking || undefined,
-      sessionId,
-      cost,
-      duration: Date.now() - start,
-      error: error || !resultSeen,
-      // Claude reports a stale --resume id as "No conversation found with session ID: …".
-      sessionExpired: error && !!sid && (isSessionError(resultText) || /no conversation found/i.test(resultText)),
-    };
+    return this.run(args, workDir, userMessage(text, images), opts, sid);
   }
 
-  // ─── CLI fallback (no AskUserQuestion) ─────────────────
-
-  private executeWithCLI(prompt: string, opts: ExecOptions): Promise<ExecResult> {
+  private run(args: string[], workDir: string | undefined, message: object, opts: ExecOptions, sid: string | undefined): Promise<ExecResult> {
     return new Promise((resolve) => {
       const { settings } = opts;
-      // -p enables print (non-interactive) mode; prompt is passed via stdin below.
-      // --max-turns is hidden from `claude --help` in 2.x but still accepted.
-      const args = ['-p', '--output-format', 'stream-json', '--verbose'];
-
-      args.push('--permission-mode', PERMISSION_MODES[settings.mode] ?? 'default');
-      if (settings.maxTurns > 0) args.push('--max-turns', String(settings.maxTurns));
-      if (settings.effort) args.push('--effort', settings.effort);
-      if (settings.model) args.push('--model', settings.model);
-      if (settings.maxBudget > 0) args.push('--max-budget-usd', String(settings.maxBudget));
-      if (settings.allowedTools) args.push('--allowedTools', settings.allowedTools);
-      if (settings.disallowedTools) args.push('--disallowedTools', settings.disallowedTools);
-      if (settings.systemPrompt) args.push('--append-system-prompt', settings.systemPrompt);
-      if (settings.bare) args.push('--bare');
-      if (settings.addDir) args.push('--add-dir', settings.addDir);
-      if (settings.sessionName) args.push('--name', settings.sessionName);
-      const sid = settings.sessionIds[this.name];
-      if (sid) args.push('--resume', sid);
-      if (opts.extraArgs) args.push(...opts.extraArgs);
-
-      log.debug(`[claude] effort=${settings.effort} model=${settings.model || 'default'} mode=${settings.mode}`);
-      log.debug(`[claude] stdin prompt length: ${prompt.length}`);
+      const start = Date.now();
+      const msgMode = settings.msgMode || 'compact';
+      const { onIntermediate } = opts;
+      const streamIntermediate = msgMode !== 'compact' && onIntermediate;
 
       const proc = this.spawnClaude(this.command, args, {
-        cwd: settings.workDir || opts.workDir,
+        cwd: workDir,
         stdio: ['pipe', 'pipe', 'pipe'],
         env: { ...process.env },
       });
 
-      // 通过 stdin 传递提示词
-      writeStdin(proc, prompt);
+      let resultText = '';
+      let thinking = '';
+      let sessionId: string | undefined;
+      let cost: number | undefined;
+      let usage: ExecResult['usage'];
+      let error = false;
+      let resultSeen = false;
+      let stopReason: 'cancel' | 'timeout' | null = null;
+      let stderr = '';
+      let settled = false;
+      // tool_use id → tool name, so parallel tool results are labelled with their own tool.
+      const toolNames = new Map<string, string>();
+      // can_use_tool requests the CLI has since cancelled: their late answers are dropped.
+      const cancelledRequests = new Set<string>();
+      let requestSeq = 0;
 
-      setupAbort(proc, opts.signal);
-      const timer = setupTimeout(proc, opts.timeout);
-      const collected = collectUtf8(proc);
+      const send = (obj: object): void => {
+        const stdin = proc.stdin;
+        if (!stdin || stdin.destroyed || stdin.writableEnded) return;
+        stdin.write(JSON.stringify(obj) + '\n', 'utf8');
+      };
+      const endInput = (): void => { if (proc.stdin && !proc.stdin.writableEnded) proc.stdin.end(); };
+      proc.stdin?.on('error', (e) => log.debug('[claude] stdin write error (ignored):', (e as Error).message));
 
-      proc.on('close', (code) => {
-        if (timer) clearTimeout(timer);
-        if (opts.signal?.aborted) { resolve({ text: '已取消', error: true }); return; }
+      // Idle timeout: re-armed on every stdout line (including tool_progress / task_progress
+      // heartbeats, which are otherwise not shown) and paused while waiting for the user, so a
+      // long-but-healthy run is never cut off while one that went silent (e.g. a tool blocked
+      // on a sudo password prompt) is stopped after `timeout` of silence.
+      let idleTimer: ReturnType<typeof setTimeout> | null = null;
+      let killTimer: ReturnType<typeof setTimeout> | null = null;
+      const pauseIdle = (): void => { if (idleTimer) clearTimeout(idleTimer); idleTimer = null; };
+      const armIdle = (): void => {
+        if (!opts.timeout || settled || stopReason) return;
+        pauseIdle();
+        idleTimer = setTimeout(() => stop('timeout'), opts.timeout);
+      };
+      // Stop politely first (interrupt ends the turn and still yields a result), then kill.
+      const stop = (reason: 'cancel' | 'timeout'): void => {
+        if (stopReason || settled) return;
+        stopReason = reason;
+        pauseIdle();
+        if (reason === 'timeout') log.warn(`[claude] 空闲超时 (${opts.timeout}ms 无消息)，发送 interrupt`);
+        send({ type: 'control_request', request_id: `wx_interrupt_${++requestSeq}`, request: { subtype: 'interrupt' } });
+        killTimer = setTimeout(() => killProc(proc), this.interruptGraceMs);
+      };
+      const onAbort = (): void => stop('cancel');
+      opts.signal?.addEventListener('abort', onAbort, { once: true });
 
-        const stdout = collected.stdout(), stderr = collected.stderr();
-        let text = '';
-        let thinking = '';
-        let sessionId: string | undefined;
-        let duration: number | undefined;
-        let cost: number | undefined;
-        let isErr = code !== 0;
+      const answerPermission = async (requestId: string, req: CanUseToolRequest): Promise<void> => {
+        const isQuestion = req.tool_name === 'AskUserQuestion';
+        if (isQuestion) pauseIdle(); // waiting on the user is not the agent going idle
+        let decision: PermissionDecision;
+        try {
+          decision = await decidePermission(req, { mode: settings.mode, askUser: opts.askUser });
+        } catch (err) {
+          decision = { behavior: 'deny', message: `权限处理出错：${(err as Error).message}` };
+        }
+        if (isQuestion) armIdle();
+        if (cancelledRequests.delete(requestId)) return;
+        send({
+          type: 'control_response',
+          response: { subtype: 'success', request_id: requestId, response: { ...decision, toolUseID: req.tool_use_id } },
+        });
+      };
 
-        const lines = stdout.trim().split('\n');
-        for (const line of lines) {
-          if (!line.trim()) continue;
-          try {
-            const obj = JSON.parse(line);
-            if (obj.type === 'assistant' && obj.message?.content && !obj.parent_tool_use_id) {
-              for (const block of obj.message.content) {
-                if (block.type === 'thinking' && block.thinking) {
-                  thinking += block.thinking;
-                }
-                if (block.type === 'text' && block.text) {
-                  text += block.text;
+      const handle = (msg: any): void => {
+        switch (msg.type) {
+          case 'control_request': {
+            const req = msg.request ?? {};
+            if (req.subtype === 'can_use_tool') { void answerPermission(msg.request_id, req as CanUseToolRequest); return; }
+            // Hooks, SDK MCP servers etc. are never registered by us; answer so nothing waits.
+            send({ type: 'control_response', response: { subtype: 'error', request_id: msg.request_id, error: `unsupported control request: ${req.subtype}` } });
+            return;
+          }
+          case 'control_cancel_request':
+            cancelledRequests.add(msg.request_id);
+            return;
+          case 'system':
+            // Known before any work happens, so a cancelled/timed-out run can still be resumed.
+            if (msg.subtype === 'init') {
+              sessionId = msg.session_id;
+              log.debug(`[claude] init model=${msg.model} permissionMode=${msg.permissionMode} version=${msg.claude_code_version}`);
+            }
+            return;
+          case 'assistant': {
+            // Messages from inside a subagent (parent_tool_use_id set) are not forwarded: the
+            // main thread's Agent/Task tool_use line and its tool_result stand for it.
+            if (msg.parent_tool_use_id) return;
+            for (const block of msg.message?.content ?? []) {
+              if (block.type === 'thinking' && block.thinking) {
+                thinking += block.thinking;
+                if (streamIntermediate) onIntermediate({ type: 'thinking', content: block.thinking });
+              }
+              if (block.type === 'text' && block.text) {
+                if (streamIntermediate && block.text.trim()) onIntermediate({ type: 'text', content: block.text });
+              }
+              if (block.type === 'tool_use') {
+                toolNames.set(block.id, block.name);
+                if (streamIntermediate) {
+                  onIntermediate({ type: 'tool_use', content: summarizeToolUse(block.name || 'Tool', block.input), toolName: block.name });
                 }
               }
             }
-            if (obj.type === 'result') {
-              if (!text) text = obj.result || '(无输出)';
-              sessionId = obj.session_id;
-              duration = obj.duration_ms;
-              if (typeof obj.total_cost_usd === 'number') cost = obj.total_cost_usd;
-              isErr = obj.is_error || obj.subtype !== 'success';
+            return;
+          }
+          case 'user': {
+            const content = msg.message?.content;
+            if (msg.parent_tool_use_id || !Array.isArray(content)) return;
+            for (const block of content) {
+              if (block.type !== 'tool_result') continue;
+              const toolName = toolNames.get(block.tool_use_id);
+              toolNames.delete(block.tool_use_id);
+              if (!streamIntermediate || !block.content) continue;
+              const summary = summarizeToolResult(toolName, block.content);
+              if (summary) onIntermediate({ type: 'tool_result', content: summary, toolName });
             }
-          } catch { continue; }
+            return;
+          }
+          case 'result':
+            resultSeen = true;
+            sessionId = msg.session_id || sessionId;
+            if (typeof msg.total_cost_usd === 'number') cost = msg.total_cost_usd;
+            if (msg.usage) {
+              usage = {
+                inputTokens: msg.usage.input_tokens ?? 0,
+                outputTokens: msg.usage.output_tokens ?? 0,
+                cacheReadTokens: msg.usage.cache_read_input_tokens,
+                cacheWriteTokens: msg.usage.cache_creation_input_tokens,
+              };
+            }
+            if (msg.subtype === 'success') {
+              resultText = msg.result || '(无输出)';
+              error = !!msg.is_error;
+            } else {
+              resultText = describeResultError(msg, settings);
+              error = true;
+            }
+            // One turn per execute(): closing stdin lets the CLI exit once the turn is done.
+            endInput();
+            return;
+          // tool_progress, task_*, status, rate-limit, keep_alive, control_response …: heartbeat only.
         }
+      };
 
-        if (text) {
-          resolve({
-            text,
-            thinking: thinking || undefined,
-            sessionId,
-            cost,
-            duration,
-            error: isErr,
-            sessionExpired: isErr && !!sid && isSessionError(text),
-          });
-        } else {
-          const fallbackText = stdout.trim() || stderr.trim() || `exit ${code}`;
-          resolve({ text: fallbackText, error: code !== 0, sessionExpired: code !== 0 && !!sid && isSessionError(fallbackText) });
+      let buf = '';
+      proc.stdout?.setEncoding('utf8');
+      proc.stdout?.on('data', (chunk: string) => {
+        buf += chunk;
+        let nl: number;
+        while ((nl = buf.indexOf('\n')) >= 0) {
+          const line = buf.slice(0, nl).trim();
+          buf = buf.slice(nl + 1);
+          if (!line) continue;
+          armIdle();
+          let msg: unknown;
+          try { msg = JSON.parse(line); } catch { log.debug(`[claude] non-JSON stdout: ${line.slice(0, 200)}`); continue; }
+          try { handle(msg); } catch (err) { log.warn('[claude] 处理消息出错:', err); }
         }
       });
-      proc.on('error', (err) => { if (timer) clearTimeout(timer); resolve({ text: `无法启动: ${err.message}`, error: true }); });
+      proc.stderr?.setEncoding('utf8');
+      proc.stderr?.on('data', (chunk: string) => { stderr = (stderr + chunk).slice(-4000); });
+
+      const finish = (res: ExecResult): void => {
+        if (settled) return;
+        settled = true;
+        pauseIdle();
+        if (killTimer) clearTimeout(killTimer);
+        opts.signal?.removeEventListener('abort', onAbort);
+        resolve(res);
+      };
+
+      proc.on('close', (code) => {
+        const duration = Date.now() - start;
+        if (stopReason === 'cancel') { finish({ text: '已取消', sessionId, cost, duration, error: true }); return; }
+        if (stopReason === 'timeout') {
+          const mins = Math.round((opts.timeout ?? 0) / 60000);
+          finish({
+            text: `执行超时（${mins} 分钟无响应），已自动中止。\n可能是某个命令在等待输入（如 sudo 密码）。`,
+            sessionId, cost, duration, error: true,
+          });
+          return;
+        }
+        if (resultSeen) {
+          finish({
+            text: resultText,
+            thinking: thinking || undefined,
+            sessionId, cost, usage, duration, error,
+            sessionExpired: error && !!sid && isStaleSession(resultText),
+          });
+          return;
+        }
+        // Exited without a result: crash, bad flag, auth failure, stale --resume id, …
+        const detail = stderr.trim() || `exit ${code}`;
+        log.warn(`[claude] 进程退出但没有 result (code=${code}): ${detail.slice(0, 300)}`);
+        finish({
+          text: `Claude Code 异常退出（code ${code}）：${detail}`,
+          sessionId, cost, duration, error: true,
+          sessionExpired: !!sid && isStaleSession(detail),
+        });
+      });
+      proc.on('error', (err) => finish({ text: `无法启动: ${err.message}`, error: true }));
+
+      // The SDK opens with initialize before the first user turn; mirror it (all session
+      // options travel as flags, so the request itself carries nothing).
+      send({ type: 'control_request', request_id: `wx_init_${++requestSeq}`, request: { subtype: 'initialize' } });
+      send(message);
+      armIdle();
     });
   }
 }
 
-function splitList(value: string): string[] {
-  return value.split(',').map(s => s.trim()).filter(Boolean);
+function isStaleSession(text: string): boolean {
+  // Claude reports a stale --resume id as "No conversation found with session ID: …".
+  return isSessionError(text) || /no conversation found/i.test(text);
 }
 
 function denyMessage(mode: ToolMode, toolName: string): string {
@@ -401,11 +379,10 @@ function denyMessage(mode: ToolMode, toolName: string): string {
     if (toolName === 'ExitPlanMode') return 'plan 模式只出计划、不执行。请把完整计划直接作为最终回复输出给用户；用户确认后会用 /mode auto 执行。';
     return `plan 模式为只读规划，不允许执行 ${toolName}；如需执行可用 /mode auto`;
   }
-  if (mode === 'auto') return `auto 模式的自动审批未放行 ${toolName}，微信内审批将在后续版本支持`;
   return `safe 模式下 ${toolName} 需要审批，微信内审批将在后续版本支持；可用 /mode auto`;
 }
 
-function describeResultError(msg: Exclude<SDKResultMessage, { subtype: 'success' }>, settings: UserSettings): string {
+function describeResultError(msg: { subtype?: string; errors?: string[] }, settings: UserSettings): string {
   if (msg.subtype === 'error_max_turns') return `已达到最大轮数（${settings.maxTurns}），任务未完成。可用 /turns 调大`;
   if (msg.subtype === 'error_max_budget_usd') return `已达到预算上限（$${settings.maxBudget}），任务已停止。可用 /budget 调整`;
   return msg.errors?.filter(Boolean).join('\n') || `执行出错（${msg.subtype}）`;
@@ -443,17 +420,17 @@ function splitMedia(media?: DownloadedMedia[]): { images: InlineImage[]; others:
   return { images, others };
 }
 
-/** Streaming-input prompt carrying one user turn. The iterable ends after this message; with
- *  canUseTool set, the SDK keeps stdin open until the run's result, then closes it. */
-async function* singleUserMessage(text: string, images: InlineImage[]): AsyncGenerator<SDKUserMessage> {
-  yield {
+/** The one user turn written to stdin (same envelope the SDK writes for a prompt). */
+function userMessage(text: string, images: InlineImage[]): object {
+  return {
     type: 'user',
+    session_id: '',
     parent_tool_use_id: null,
     message: {
       role: 'user',
       content: [
-        ...images.map((img) => ({ type: 'image' as const, source: { type: 'base64' as const, media_type: img.mediaType, data: img.data } })),
-        ...(text.trim() ? [{ type: 'text' as const, text }] : []),
+        ...images.map((img) => ({ type: 'image', source: { type: 'base64', media_type: img.mediaType, data: img.data } })),
+        ...(text.trim() || images.length === 0 ? [{ type: 'text', text }] : []),
       ],
     },
   };

@@ -99,6 +99,8 @@ export interface ExecResult {
   thinking?: string;
   sessionId?: string;
   cost?: number;
+  /** Token usage reported by the CLI for this run, when it reports one. */
+  usage?: { inputTokens: number; outputTokens: number; cacheReadTokens?: number; cacheWriteTokens?: number };
   duration?: number;
   error?: boolean;
   /** Set by the adapter when the error is positively identified as a session/resume failure. */
