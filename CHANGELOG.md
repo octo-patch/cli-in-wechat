@@ -8,7 +8,7 @@
 
 - 通用 ACP 适配器（自写 JSON-RPC over stdio，无新依赖）和 8 个内置预设：Qwen Code、GitHub Copilot CLI、Cursor CLI、CodeBuddy Code、Factory Droid、Devin CLI、Qoder CLI、MiniMax Code（#41）
 - `config.json` 的 `agents`：不写代码接入任意 CLI，支持 `protocol: "acp"` 和 `protocol: "text"`，可覆盖或关闭内置预设（#42）
-- 微信内工具审批：`/mode safe` 下回 `1` 允许一次 / `2` 本会话总是允许此类操作 / `3` 拒绝，5 分钟无回复自动拒绝；审批和 AskUser 提问共用一个按顺序处理的队列（#43）
+- 微信内工具审批：`/mode safe` 下回 `1` 允许一次 / `2` 本会话自动允许同类操作（命令按程序名，仅存内存）/ `3` 拒绝，送达后 5 分钟无回复自动拒绝；等待时非选项回复不会被吞掉，`@<其他工具>` 照常执行；审批和 AskUser 提问共用一个按顺序处理的队列（#43）
 - `/use [名字]`：按注册表切换任意工具或列出已安装工具；`@<任意工具名>` 单次指定（#44）
 - `/set [键] [值]`：收纳各 CLI 专属开关，`/set` 列出当前工具的键，`/set all` 列出全部（#45）
 - Codex：流式输出、`/effort`、原生图片输入（`--image`）（#36）
