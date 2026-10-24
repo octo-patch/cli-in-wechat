@@ -499,6 +499,74 @@ test('a V2 server is refused with an actionable message', async () => {
   );
 });
 
+function childCreated(id: string, parentID: string) {
+  // 1.19 shape: `sessionID` is the child's own id, so the per-session filter alone drops it.
+  return { type: 'session.created', properties: { sessionID: id, info: { id, parentID } } };
+}
+
+test('subagent permission and question requests are answered too', async () => {
+  const fake = createFakeClient({
+    events: [
+      childCreated('ses_child', 'ses_active'),
+      // Grandchild, announced the pre-1.19 way (no top-level sessionID).
+      { type: 'session.created', properties: { info: { id: 'ses_grand', parentID: 'ses_child' } } },
+      { ...permissionAsked('per_child'), properties: { ...permissionAsked('per_child').properties, sessionID: 'ses_child' } },
+      { type: 'permission.updated', properties: { id: 'per_grand', sessionID: 'ses_grand', title: 'edit' } },
+      { ...questionAsked('que_child'), properties: { ...questionAsked('que_child').properties, sessionID: 'ses_child' } },
+      IDLE,
+    ],
+  });
+  const asked: any[] = [];
+
+  await new OpenCodeAdapter(fake.factory).execute('hi', {
+    settings: settings({ mode: 'auto', sessionIds: { opencode: 'ses_active' } }),
+    askUser: async (req) => { asked.push(req); return { 'Which database?': 'Postgres' }; },
+  });
+
+  // Left unanswered, a subagent's request blocks the parent turn until the timeout.
+  assert.equal(fake.find('POST /permission/{requestID}/reply').path.requestID, 'per_child');
+  // The legacy route is session-scoped: it must name the session that asked.
+  const legacy = fake.find('permission.respond');
+  assert.equal(legacy.path.permissionID, 'per_grand');
+  assert.equal(legacy.path.id, 'ses_grand');
+  assert.equal(asked.length, 1);
+  assert.deepEqual(fake.find('POST /question/{requestID}/reply').body, { answers: [['Postgres']] });
+});
+
+test('requests and output from sessions outside the turn are ignored', async () => {
+  const fake = createFakeClient({
+    events: [
+      ASSISTANT_TURN,
+      childCreated('ses_child', 'ses_active'),
+      childCreated('ses_other_child', 'ses_other'),
+      { ...permissionAsked('per_other'), properties: { ...permissionAsked('per_other').properties, sessionID: 'ses_other_child' } },
+      { ...permissionAsked('per_x'), properties: { ...permissionAsked('per_x').properties, sessionID: 'ses_other' } },
+      // Child text/tool streams stay out of the WeChat reply.
+      {
+        type: 'message.part.updated',
+        properties: {
+          sessionID: 'ses_child',
+          part: { type: 'text', id: 'prt_c', messageID: 'msg_c', sessionID: 'ses_child', text: 'child chatter' },
+        },
+      },
+      textPart('prt_1', 'root reply'),
+      IDLE,
+    ],
+  });
+  const activity: IntermediateMessage[] = [];
+
+  const result = await new OpenCodeAdapter(fake.factory).execute('hi', {
+    settings: settings({ mode: 'auto', sessionIds: { opencode: 'ses_active' } }),
+    onIntermediate: (msg) => activity.push(msg),
+  });
+
+  // The server is shared across WeChat users: another user's requests are not ours to answer.
+  assert.equal(fake.names().includes('POST /permission/{requestID}/reply'), false);
+  assert.equal(fake.names().includes('permission.respond'), false);
+  assert.equal(activity.some((msg) => msg.content.includes('child chatter')), false);
+  assert.equal(result.text, 'root reply');
+});
+
 test('a V1 server without a version route is still used', async () => {
   const fake = createFakeClient({
     healthVersion: null,

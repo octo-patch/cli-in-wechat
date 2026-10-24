@@ -420,6 +420,8 @@ private resolveModelArg(model: string, workDir?: string): string {
     // Permission/question request ids already answered this turn. A 1.19 server may
     // announce the same request under both the new and the legacy event name.
     const answeredRequests = new Set<string>();
+    // The root session plus every subagent session spawned under it during this turn.
+    const turnSessions = new Set<string>([sessionId]);
 
     const msgMode = settings.msgMode || 'normal';
     const streamIntermediate = msgMode !== 'compact' && onIntermediate;
@@ -427,7 +429,7 @@ private resolveModelArg(model: string, workDir?: string): string {
     // 1.19 servers announce `permission.asked` and take `POST /permission/{id}/reply`;
     // older ones announce `permission.updated` and only know the session-scoped route,
     // which 1.19 still serves — so it doubles as the fallback.
-    const replyPermission = async (id: string, modern: boolean, reply: 'always' | 'reject') => {
+    const replyPermission = async (id: string, owner: string, modern: boolean, reply: 'always' | 'reject') => {
       if (modern) {
         try {
           await postJson(client, '/permission/{requestID}/reply', { path: { requestID: id }, body: { reply }, ...dirOpt });
@@ -437,7 +439,8 @@ private resolveModelArg(model: string, workDir?: string): string {
         }
       }
       await client.postSessionIdPermissionsPermissionId({
-        path: { id: sessionId, permissionID: id },
+        // The legacy route is scoped to the session that asked, which may be a child.
+        path: { id: owner, permissionID: id },
         body: { response: reply },
         ...dirOpt,
         throwOnError: true,
@@ -491,11 +494,23 @@ private resolveModelArg(model: string, workDir?: string): string {
           const properties = (ev as any)?.properties as Record<string, unknown> | undefined;
           if (!properties) continue;
 
-          // Only process events for our session
+          // Subagents (the task tool) run in child sessions whose permission and question
+          // requests block the parent just the same, so the turn's session tree is
+          // tracked from `parentID`. 1.19 stamps `session.created` with the child's own
+          // id, hence this runs before the per-session filter below.
+          if (type === 'session.created' || type === 'session.updated') {
+            const info = (properties as any).info as { id?: string; parentID?: string } | undefined;
+            if (info?.id && info.parentID && turnSessions.has(info.parentID)) turnSessions.add(info.id);
+            continue;
+          }
+
+          // Only process events for our session; permission/question requests from the
+          // turn's child sessions too. Text and tool streams stay root-only.
           const evSessionId = (properties as any).sessionID
             || (properties as any).info?.sessionID
             || (properties as any).part?.sessionID;
-          if (evSessionId && evSessionId !== sessionId) continue;
+          const isRequest = type === 'permission.asked' || type === 'permission.updated' || type === 'question.asked';
+          if (evSessionId && evSessionId !== sessionId && !(isRequest && turnSessions.has(evSessionId))) continue;
 
           switch (type) {
             case 'message.updated': {
@@ -586,7 +601,7 @@ private resolveModelArg(model: string, workDir?: string): string {
               if (!permission.id || answeredRequests.has(`permission:${permission.id}`)) break;
               answeredRequests.add(`permission:${permission.id}`);
               const response = settings.mode === 'auto' ? 'always' : 'reject';
-              void replyPermission(permission.id, type === 'permission.asked', response).catch((err: unknown) => {
+              void replyPermission(permission.id, evSessionId || sessionId, type === 'permission.asked', response).catch((err: unknown) => {
                 log.warn(`[opencode/sdk] permission reply failed: ${(err as Error).message}`);
               });
               if (response === 'reject' && streamIntermediate) {
