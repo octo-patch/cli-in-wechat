@@ -213,6 +213,30 @@ Claude Code 需要你做选择时，问题自动转发到微信：
 > **安全：默认只允许当前扫码登录用户。** 如需增加管理员，请填写 `allowedUsers`；
 > 只有显式设置 `allowAllUsers: true` 才会允许任意好友以完整权限运行 CLI。
 
+### 自定义 Agent（无需写代码）
+
+在 `config.json` 里加 `agents` 即可接入任意 CLI；改完重启生效：
+
+```jsonc
+{
+  "agents": [
+    // 支持 ACP 的 CLI：一个进程一条消息，支持流式、会话恢复和 /mode
+    { "name": "my-acp", "displayName": "My Agent", "command": "my-agent", "args": ["acp"], "protocol": "acp",
+      "modeIds": { "auto": "yolo", "safe": "default", "plan": "plan" } },
+    // 纯文本 CLI：prompt 走 stdin（默认），返回 stdout；无会话恢复，/mode 恒为 auto
+    { "name": "llm", "command": "llm", "args": ["-m", "gpt-4o"], "protocol": "text" },
+    // prompt 作为参数：args 里的 {prompt} 会被替换（没有占位符则追加到末尾）
+    { "name": "aider", "command": "aider", "args": ["--yes", "--message", "{prompt}"], "protocol": "text", "promptVia": "arg" },
+    // 同名覆盖内置 ACP 预设的字段 / 关闭某个预设
+    { "name": "cursor", "command": "agent" },
+    { "name": "devin", "disabled": true }
+  ]
+}
+```
+
+> `name` 只能用小写字母、数字和 `-`，不能与 claude/codex/gemini/kimi/opencode 重名；`env` 可追加环境变量。
+> 写错的条目只会在启动日志里警告并跳过，不影响其他工具。
+
 ## 网络与代理（故障排查）
 
 所有对微信接口的请求都带 **超时 + 指数退避抖动重试 + 可读诊断**。瞬时网络抖动

@@ -51,7 +51,7 @@ async function main() {
   // ─── 1. Detect CLI tools ─────────────────────────────
 
   log.info('检测已安装的 CLI 工具...');
-  const registry = new AdapterRegistry();
+  const registry = new AdapterRegistry(config.agents);
   await registry.detectAvailable();
 
   const available = registry.getAvailableNames();
