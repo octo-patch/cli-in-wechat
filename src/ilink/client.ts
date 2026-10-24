@@ -1,4 +1,4 @@
-import { randomUUID, randomBytes } from 'node:crypto';
+import { createHash, randomUUID, randomBytes } from 'node:crypto';
 import { readFileSync, existsSync, statSync, mkdirSync } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
 import { generateWechatUin, encryptAesEcb, aesEcbPaddedSize, encodeMessageAesKey, md5 } from '../utils/crypto.js';
@@ -238,17 +238,27 @@ export class ILinkClient {
 
   // ─── Long-polling loop ─────────────────────────────────
 
+  /**
+   * One long-poll round. The cursor is committed only after every message in the
+   * batch was either skipped as a duplicate or durably handed off by the
+   * handlers; any handler failure leaves the whole batch replayable, and the
+   * durable inbound ledger keeps already-completed messages from re-running.
+   */
+  private async pollOnce(): Promise<void> {
+    const msgs = await this.getUpdates();
+    this.backoffMs = 1000;
+    this.consecutiveFailures = 0;
+
+    for (const msg of msgs) {
+      await this.processMessage(msg);
+    }
+    this.commitPendingPollCursor();
+  }
+
   private async pollLoop(): Promise<void> {
     while (this.running) {
       try {
-        const msgs = await this.getUpdates();
-        this.backoffMs = 1000;
-        this.consecutiveFailures = 0;
-
-        for (const msg of msgs) {
-          await this.processMessage(msg);
-        }
-        this.commitPendingPollCursor();
+        await this.pollOnce();
       } catch (err: unknown) {
         if (!this.running) return;
 
@@ -450,6 +460,10 @@ export class ILinkClient {
     this.quota.completeInbound(msg.from_user_id, msg.message_id);
   }
 
+  getAccountId(): string {
+    return this.accountId;
+  }
+
   getContextToken(userId: string): string | undefined {
     return this.contextTokens.get(userId);
   }
@@ -537,6 +551,14 @@ export class ILinkClient {
     streamType?: SendStreamType;
     priority?: OutboxItem['priority'];
     generation?: number;
+    /**
+     * Stable identity for durable task output: chunk i is stored as
+     * `${itemIdPrefix}#${i}` with a client_id derived from it, so re-enqueueing
+     * the same output after a restart is idempotent while it is still queued.
+     */
+    itemIdPrefix?: string;
+    /** Invoked synchronously once the outbox durably holds every chunk, before any send. Errors are logged, not thrown. */
+    onEnqueued?: (items: OutboxItem[]) => void;
   }): Promise<SendResult[]> {
     const streamType = options?.streamType || 'regular';
     return this.enqueueSend(userId, async () => {
@@ -544,14 +566,22 @@ export class ILinkClient {
       const chunks = chunkUtf8Text(text, this.bodyChunkBytes);
       const priority = options?.priority || (streamType === 'intermediate' ? 'intermediate' as const : 'final' as const);
       const generation = options?.generation ?? snapshot.generation;
-      const items = this.outbox.enqueueTextBatch(chunks.map((chunk) => ({
+      const prefix = options?.itemIdPrefix;
+      const items = this.outbox.enqueueTextBatch(chunks.map((chunk, index) => ({
           accountId: this.accountId,
           userId,
           generation,
           tokenVersion: snapshot.tokenVersion,
           priority,
           text: chunk,
+          ...(prefix ? { itemId: `${prefix}#${index}`, clientId: stableClientId(`${prefix}#${index}`) } : {}),
         })));
+      try {
+        options?.onEnqueued?.(items);
+      } catch (error) {
+        // Bookkeeping must never block delivery of what the outbox already holds.
+        log.error('[delivery] onEnqueued 回调失败:', error);
+      }
       for (const item of items) {
         this.diagnostics.record({
           event: 'queue-enqueue',
@@ -1319,6 +1349,12 @@ function errorDetails(error: unknown): ApiErrorDetails {
   const details = (error as { details?: ApiErrorDetails } | null)?.details;
   if (details) return details;
   return { errmsg: error instanceof Error ? error.message : String(error) };
+}
+
+/** Deterministic UUID-shaped client_id so iLink can de-duplicate a resent durable output. */
+function stableClientId(seed: string): string {
+  const hex = createHash('sha256').update(seed).digest('hex');
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`;
 }
 
 function loadContextTokensAt(filePath: string): Map<string, string> {
