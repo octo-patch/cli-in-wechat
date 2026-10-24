@@ -203,6 +203,8 @@ Claude 请求权限：Run `npm test`
 - `protocol` 默认 `acp`；`modeIds` 把 `/mode` 映射到该 agent 自己的 ACP 模式 ID，不写就只靠权限请求来区分模式。
 - `name` 只能用小写字母、数字和 `-`，不能与 claude/codex/gemini/kimi/opencode 重名；`env` 可追加环境变量。
 - 写错的条目只会在启动日志里警告并跳过，不影响其他工具。
+- 覆盖预设时如果改了 `protocol`，就不再继承预设的 `args` / `modeIds`。
+- Windows 下 `promptVia: "arg"` 要求命令能直接定位到 .exe/.js（不经过 cmd.exe），否则为防注入会拒绝执行，请改用 stdin。
 - 之后用 `/use my-acp` 或 `@my-acp 你好` 调用。
 
 ## 从 0.1.x 升级
