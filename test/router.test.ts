@@ -39,6 +39,11 @@ function createRouter() {
     isAvailable: (name: string) => ['claude', 'codex', 'gemini'].includes(name),
     getNameByDisplayName: (displayName: string) => ({ Claude: 'claude', Codex: 'codex', Gemini: 'gemini' }[displayName]),
     getAvailableNames: () => ['claude', 'codex', 'gemini'],
+    getAll: () => [
+      { name: 'claude', displayName: 'Claude' },
+      { name: 'codex', displayName: 'Codex' },
+      { name: 'gemini', displayName: 'Gemini' },
+    ],
     get: (name: string) => ({
       name,
       displayName: name === 'claude' ? 'Claude' : name === 'codex' ? 'Codex' : 'Gemini',

@@ -66,6 +66,7 @@ function createRouter(adapters: Record<string, Execute>) {
     isAvailable: (name: string) => names.includes(name),
     getNameByDisplayName: (display: string) => names.find((name) => displayName(name) === display),
     getAvailableNames: () => names,
+    getAll: () => names.map((name) => ({ name, displayName: displayName(name) })),
     get: (name: string) => (adapters[name] ? {
       name,
       displayName: displayName(name),
@@ -447,6 +448,7 @@ function boot(dir: string, bootId: string, execute: Execute, maxItemsPerWindow =
     isAvailable: (name: string) => name === 'claude',
     getNameByDisplayName: () => undefined,
     getAvailableNames: () => ['claude'],
+    getAll: () => [{ name: 'claude', displayName: 'Claude' }],
     get: (name: string) => (name === 'claude' ? {
       name: 'claude',
       displayName: 'Claude',
