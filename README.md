@@ -274,7 +274,7 @@ src/
 │   ├── claude.ts         # Agent SDK + CLI 降级
 │   ├── codex.ts          # codex exec + stdin 传参
 │   ├── gemini.ts         # gemini + stdin 传参 (-o json)
-│   ├── kimi.ts           # kimi -p (argv 传参, spawnCli 防 cmd.exe 损坏) + --continue 续会话
+│   ├── kimi.ts           # kimi -p (argv 传参, spawnCli 防 cmd.exe 损坏) + stream-json + -S <id> 续会话
 │   ├── opencode.ts       # opencode run --format json
 │   └── registry.ts       # 自动检测已安装工具
 ├── bridge/               # 桥接逻辑

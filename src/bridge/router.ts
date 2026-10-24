@@ -1,4 +1,5 @@
-import { readdirSync, readFileSync, statSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
+import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { execSync } from 'node:child_process';
@@ -11,8 +12,30 @@ import type { WeixinMessage } from '../ilink/types.js';
 import type { BridgeConfig } from '../config.js';
 import { DEFAULT_SETTINGS, type AskUserRequest, type MsgMode } from '../adapters/base.js';
 import type { DownloadedMedia } from '../utils/media.js';
+import type { OutboxItem } from '../ilink/outbox.js';
+import {
+  InboundTaskStore,
+  type DeliveryOutcome,
+  type ExecDeliveryOutcome,
+  type InboundTask,
+  type RecoveryReason,
+  type TaskFileStep,
+  type TaskOutput,
+} from './task-store.js';
 
 interface ActiveTask { abort: AbortController; tool: string }
+
+/** The durable task an Agent run belongs to. Direct calls (tests, legacy paths) get an ephemeral one. */
+interface TaskRun { taskId: string; store: InboundTaskStore; generation?: number }
+
+export interface RouterOptions {
+  /** Durable inbound task ledger. Defaults to memory-only (no restart recovery). */
+  taskStore?: InboundTaskStore;
+  /** Identity of this process' runners; a task owned by any other boot was interrupted. */
+  bootId?: string;
+}
+
+type DeliveryStatusView = { quota: { generation: number }; pending: Array<Pick<OutboxItem, 'itemId'>>; failed?: Array<Pick<OutboxItem, 'itemId'>> };
 interface PendingQuestion { resolve: (answer: string) => void; timeout: ReturnType<typeof setTimeout>; toolName: string }
 
 /** Built fresh per call: a shared /g regex carries lastIndex state across calls. */
@@ -25,7 +48,7 @@ const MAX_MARKER_CARRY = 256;
 /**
  * Build a stripper for `[SEND_FILE: …]` markers in text about to be streamed to WeChat.
  *
- * parseAndSendFiles() removes these markers, but only from the FINAL consolidated
+ * buildOutputs() removes these markers, but only from the FINAL consolidated
  * response. In normal/verbose msgMode the text is also pushed to WeChat as it streams,
  * which bypasses that strip entirely — so the raw marker leaked into the chat. Since the
  * marker is almost always the last thing in a response, nothing arrives to interrupt the
@@ -74,23 +97,54 @@ export class Router {
   private lastResponse = new Map<string, { tool: string; text: string }>();
   private pendingQuestions = new Map<string, PendingQuestion>();
   private _lastSessionList: Array<{ id: string; date: string; summary: string }> | null = null;
+  private readonly tasks: InboundTaskStore;
+  private readonly bootId: string;
+  /** In-process runner registry: at most one background runner per task id. */
+  private runners = new Map<string, Promise<void>>();
+  /**
+   * Outputs the outbox accepted while the ledger could not record it (`taskId#index` → item ids).
+   * Consulted before any re-enqueue so an in-process resume never duplicates them; the durable
+   * mark is retried on every later touch.
+   */
+  private enqueuedNotRecorded = new Map<string, string[]>();
+  private stopping = false;
 
-  constructor(ilink: ILinkClient, registry: AdapterRegistry, sessions: SessionManager, config: BridgeConfig) {
+  constructor(
+    ilink: ILinkClient,
+    registry: AdapterRegistry,
+    sessions: SessionManager,
+    config: BridgeConfig,
+    options: RouterOptions = {},
+  ) {
     this.ilink = ilink;
     this.registry = registry;
     this.sessions = sessions;
     this.config = config;
+    this.tasks = options.taskStore ?? new InboundTaskStore();
+    this.bootId = options.bootId ?? randomUUID();
   }
 
+  /**
+   * Recover durable tasks left by a previous boot, then accept inbound. Must run
+   * before the poll loop starts so restart reconciliation sees a quiet outbox.
+   */
   start(): void {
-    this.ilink.onMessage((msg, text, refText, media) => {
-      this.handle(msg, text, refText, media).catch((e) => log.error('路由异常:', e));
-    });
+    this.recoverTasks();
+    this.ilink.onMessage((msg, text, refText, media) => this.acceptInbound(msg, text, refText, media));
+  }
+
+  /** Resolves once every background runner of this process has settled (tests, shutdown). */
+  async whenIdle(): Promise<void> {
+    while (this.runners.size > 0) {
+      await Promise.allSettled([...this.runners.values()]);
+    }
   }
 
   /** Abort every in-flight CLI task and cancel pending questions — called on shutdown so
-   *  spawned children get a SIGTERM/taskkill instead of being orphaned. */
+   *  spawned children get a SIGTERM/taskkill instead of being orphaned. Tasks owned by
+   *  this boot keep their durable phase, so the next boot classifies them explicitly. */
   stop(): void {
+    this.stopping = true;
     const seen = new Set<AbortController>();
     for (const task of this.active.values()) {
       if (!seen.has(task.abort)) { seen.add(task.abort); task.abort.abort(); }
@@ -207,45 +261,525 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
     }
   }
 
-  private async sendNormalActivityBatches(uid: string, lines: string[], generation?: number): Promise<boolean> {
+  /** Oversized Normal-mode activity as titled batches; empty when one message suffices. */
+  private normalActivityOutputs(lines: string[]): TaskOutput[] {
     const batches = this.splitNormalActivityLines(lines);
-    if (batches.length <= 1) return false;
+    if (batches.length <= 1) return [];
+    return batches.map((batch, i) => ({
+      text: [`Activity (${i + 1}/${batches.length})`, ...batch].join('\n'),
+      priority: 'activity' as const,
+      enqueued: false,
+      ...(i < batches.length - 1 ? { delayAfterMs: NORMAL_ACTIVITY_SPLIT_DELAY_MS } : {}),
+    }));
+  }
 
-    for (let i = 0; i < batches.length; i++) {
-      const title = `Activity (${i + 1}/${batches.length})`;
-      await this.sendTextAfterConfirmation(
-        uid,
-        [title, ...batches[i]].join('\n'),
-        { priority: 'activity', generation },
-        'activity',
-      );
-      if (i < batches.length - 1) await this.sleep(NORMAL_ACTIVITY_SPLIT_DELAY_MS);
+  private async sendNormalActivityBatches(uid: string, lines: string[], generation?: number): Promise<boolean> {
+    const outputs = this.normalActivityOutputs(lines);
+    if (outputs.length === 0) return false;
+
+    for (const output of outputs) {
+      await this.sendTextAfterConfirmation(uid, output.text, { priority: 'activity', generation }, 'activity');
+      if (output.delayAfterMs) await this.sleep(output.delayAfterMs);
     }
     return true;
   }
 
 
-  private async handle(msg: WeixinMessage, text: string, refText: string, media?: DownloadedMedia[]): Promise<void> {
+  private isAllowed(uid: string): boolean {
+    return this.config.allowAllUsers || this.config.allowedUsers.includes(uid);
+  }
+
+  private accountId(): string {
+    return (this.ilink as ILinkClient & { getAccountId?: () => string }).getAccountId?.call(this.ilink) || 'default-account';
+  }
+
+  private deliveryStatus(uid: string): DeliveryStatusView | undefined {
+    return (this.ilink as ILinkClient & {
+      getDeliveryStatus?: (userId: string) => DeliveryStatusView;
+    }).getDeliveryStatus?.call(this.ilink, uid);
+  }
+
+  // ─── Durable inbound lifecycle (issue #27) ─────────────
+
+  /**
+   * Poll-path handler. Synchronously persists the inbound as a `received` task and
+   * returns; the ILinkClient only completes the inbound and commits the poll cursor
+   * after this returns, so a failure here leaves the inbound replayable. Agent work
+   * runs in a background runner that never holds the poll request open.
+   */
+  private acceptInbound(msg: WeixinMessage, text: string, refText: string, media?: DownloadedMedia[]): void {
     const uid = msg.from_user_id;
-    if (!this.config.allowAllUsers && !this.config.allowedUsers.includes(uid)) return;
+    if (!this.isAllowed(uid)) return;
+    const { task, created } = this.tasks.handoff({
+      accountId: this.accountId(),
+      userId: uid,
+      messageId: String(msg.message_id),
+      text,
+      refText,
+      media,
+      generation: this.deliveryStatus(uid)?.quota.generation,
+    });
+    if (!created) log.debug(`[task] 入站重放，沿用已有任务 ${task.taskId} (${task.phase})`);
+    if (task.phase === 'received') this.runInBackground(task.taskId, () => this.dispatchTask(task.taskId));
+  }
+
+  private runInBackground(taskId: string, work: () => Promise<void>): void {
+    if (this.stopping || this.runners.has(taskId)) return;
+    const runner: Promise<void> = Promise.resolve()
+      .then(work)
+      .catch((err) => log.error(`[task] ${taskId} 后台执行异常:`, err))
+      .finally(() => {
+        if (this.runners.get(taskId) === runner) this.runners.delete(taskId);
+      });
+    this.runners.set(taskId, runner);
+  }
+
+  private async dispatchTask(taskId: string): Promise<void> {
+    // The durable claim is the cross-replay guard: only a `received` task can be
+    // claimed, so a concurrent replay or a second runner finds nothing to do.
+    const task = this.tasks.claim(taskId, this.bootId);
+    if (!task) return;
+    const run: TaskRun = { taskId, store: this.tasks, generation: task.inbound.generation };
+    const msg = {
+      message_id: Number(task.messageId) || 0,
+      from_user_id: task.userId,
+      to_user_id: '',
+      client_id: '',
+      create_time_ms: task.createdAt,
+      message_type: 1,
+      message_state: 0,
+      context_token: '',
+      item_list: [],
+    } as WeixinMessage;
+    try {
+      await this.handle(msg, task.inbound.text, task.inbound.refText, task.inbound.media, run);
+    } catch (err) {
+      log.error(`[task] ${taskId} 处理失败:`, err);
+      if (this.stopping) return;
+      const current = this.tasks.get(taskId);
+      if (current?.phase === 'dispatching') {
+        this.tasks.complete(taskId, 'handler-error', errorMessage(err));
+      } else if (current?.phase === 'running') {
+        this.enterRecovery(current, 'runner-error', `runner threw while the agent phase was open: ${errorMessage(err)}`);
+        await this.resumeTaskDelivery(taskId);
+      }
+      return;
+    }
+    if (this.stopping) return;
+    if (this.tasks.get(taskId)?.phase === 'dispatching') this.tasks.complete(taskId, 'no-agent');
+  }
+
+  /**
+   * Restart reconciliation. Runs synchronously before any delivery so that
+   * outputs a previous boot enqueued (but crashed before recording) are matched
+   * against the outbox while nothing can drain it yet.
+   */
+  private recoverTasks(): void {
+    const live = this.tasks.list({ phases: ['received', 'dispatching', 'running', 'delivery-pending', 'recovery-required'] });
+    const resumable: string[] = [];
+    for (const task of live) {
+      try {
+        if (task.phase === 'received') {
+          resumable.push(task.taskId);
+          continue;
+        }
+        if ((task.phase === 'dispatching' || task.phase === 'running') && task.runner?.bootId !== this.bootId) {
+          this.enterRecovery(
+            task,
+            task.phase === 'running' ? 'agent-interrupted' : 'interrupted-during-dispatch',
+            task.phase === 'running'
+              ? `agent ${task.agent?.tool ?? '?'} was executing when boot ${task.runner?.bootId ?? '?'} stopped; its outcome was never recorded`
+              : `boot ${task.runner?.bootId ?? '?'} stopped after claiming the task and before any agent started`,
+          );
+        }
+        const current = this.tasks.get(task.taskId);
+        if (current && (current.phase === 'delivery-pending' || current.phase === 'recovery-required')) {
+          this.reconcileEnqueuedOutputs(current);
+          resumable.push(task.taskId);
+        }
+      } catch (err) {
+        log.error(`[task] 恢复任务 ${task.taskId} 失败:`, err);
+      }
+    }
+    for (const taskId of resumable) {
+      const task = this.tasks.get(taskId);
+      if (task?.phase === 'received') this.runInBackground(taskId, () => this.dispatchTask(taskId));
+      else if (task && this.needsDeliveryResume(task)) {
+        this.runInBackground(taskId, () => this.resumeTaskDelivery(taskId));
+      }
+    }
+  }
+
+  private enterRecovery(task: InboundTask, reason: RecoveryReason, detail: string): void {
+    const tool = task.agent?.tool;
+    const snippet = task.inbound.text.length > 60 ? `${task.inbound.text.slice(0, 60)}…` : task.inbound.text;
+    const text = reason === 'interrupted-during-dispatch'
+      ? `⚠️ 桥接服务在处理你的消息时中断（尚未调用 Agent）。为避免重复执行，没有自动重试。\n原消息: ${snippet}\n如需执行请重新发送；/tasks 查看详情。`
+      : reason === 'runner-error'
+        ? `⚠️ 处理你的消息时桥接服务内部出错，${tool ?? 'Agent'} 可能已开始执行，无法确认它是否已完成或已产生副作用，因此不会自动重跑。\n原消息: ${snippet}\n请检查工作区状态后再决定是否重新发送；/tasks 查看详情。`
+        : `⚠️ 桥接服务中断时 ${tool ?? 'Agent'} 仍在执行你的消息，无法确认它是否已完成或已产生副作用，因此不会自动重跑。\n原消息: ${snippet}\n请检查工作区状态后再决定是否重新发送；/tasks 查看详情。`;
+    this.tasks.requireRecovery(task.taskId, {
+      reason,
+      at: Date.now(),
+      phase: task.phase,
+      ownerBootId: task.runner?.bootId,
+      detectedByBootId: this.bootId,
+      tool,
+      agentStartedAt: task.agent?.startedAt,
+      detail,
+    }, { text, priority: 'final', enqueued: false });
+    log.warn(`[task] ${task.taskId} → recovery-required (${reason}): ${detail}`);
+  }
+
+  /** Delivery may still be owed: outputs not yet built/enqueued, or enqueued chunks still queued. */
+  private needsDeliveryResume(task: InboundTask): boolean {
+    if (task.phase === 'delivery-pending') return true;
+    if (task.phase !== 'recovery-required' || !task.outputs) return false;
+    if (task.outputs.some((_output, index) => !this.isOutputEnqueued(task, index))) return true;
+    return this.hasPendingTaskItems(task.userId, { taskId: task.taskId, store: this.tasks });
+  }
+
+  /** Does this user have task output still owed (other than `excludeTaskId`)? */
+  private hasOwedTaskDelivery(uid: string, excludeTaskId?: string): boolean {
+    return this.tasks.list({ userId: uid, phases: ['delivery-pending', 'recovery-required'] })
+      .some((task) => task.taskId !== excludeTaskId && this.needsDeliveryResume(task));
+  }
+
+  private isOutputEnqueued(task: InboundTask, index: number): boolean {
+    return Boolean(task.outputs?.[index]?.enqueued) || this.enqueuedNotRecorded.has(`${task.taskId}#${index}`);
+  }
+
+  private taskItemIds(task: InboundTask): Set<string> {
+    const ids = new Set(task.outputs?.flatMap((output) => output.itemIds || []) || []);
+    task.outputs?.forEach((_output, index) => {
+      for (const id of this.enqueuedNotRecorded.get(`${task.taskId}#${index}`) || []) ids.add(id);
+    });
+    return ids;
+  }
+
+  private outputPrefix(taskId: string, index: number): string {
+    return `${taskId}:o${index}`;
+  }
+
+  /** Mark outputs whose chunks already sit in the outbox (crash between enqueue and record). */
+  private reconcileEnqueuedOutputs(task: InboundTask): void {
+    if (!task.outputs?.some((output) => !output.enqueued)) return;
+    const status = this.deliveryStatus(task.userId);
+    const known = [...(status?.pending || []), ...(status?.failed || [])].map((item) => item.itemId);
+    task.outputs.forEach((output, index) => {
+      if (output.enqueued) return;
+      const prefix = `${this.outputPrefix(task.taskId, index)}#`;
+      const ids = known.filter((itemId) => itemId.startsWith(prefix));
+      if (ids.length > 0) this.tasks.markOutputEnqueued(task.taskId, index, ids);
+    });
+  }
+
+  /** Each fresh inbound may open a delivery window: re-drive this user's unfinished task output. */
+  private resumeUserTasks(uid: string, excludeTaskId?: string): Promise<void> {
+    const runs: Promise<void>[] = [];
+    for (const task of this.tasks.list({ userId: uid, phases: ['delivery-pending', 'recovery-required'] })) {
+      if (task.taskId === excludeTaskId || !this.needsDeliveryResume(task)) continue;
+      this.runInBackground(task.taskId, () => this.resumeTaskDelivery(task.taskId));
+      const runner = this.runners.get(task.taskId);
+      if (runner) runs.push(runner);
+    }
+    return Promise.allSettled(runs).then(() => undefined);
+  }
+
+  /** Delivery-only resume: never touches an adapter. */
+  private async resumeTaskDelivery(taskId: string): Promise<void> {
+    const task = this.tasks.get(taskId);
+    if (!task) return;
+    try {
+      await this.deliverTask(task.userId, { taskId, store: this.tasks });
+    } catch (err) {
+      log.error(`[task] ${taskId} 交付暂停，等待下次入站或重启后继续:`, err);
+    }
+  }
+
+  private ephemeralRun(uid: string, generation?: number): TaskRun {
+    const store = new InboundTaskStore();
+    const { task } = store.handoff({
+      accountId: this.accountId(),
+      userId: uid,
+      messageId: `adhoc-${randomUUID()}`,
+      text: '',
+      refText: '',
+      generation,
+    });
+    store.claim(task.taskId, this.bootId);
+    return { taskId: task.taskId, store, generation };
+  }
+
+  /** running → delivery-pending. If the ledger cannot be written, deliver from an
+   *  ephemeral copy: the durable task stays `running` and the next boot reports
+   *  it as recovery-required instead of silently claiming success. */
+  private commitOutcome(run: TaskRun, outcome: DeliveryOutcome): TaskRun {
+    // Without a media step the final message sequence is already known: record the
+    // outcome and its outputs in one write instead of two.
+    const outputs = outcome.kind === 'texts' || !sendFileMarkerRegex().test(outcome.text)
+      ? this.buildOutputs(outcome, { sent: [], failed: [] })
+      : undefined;
+    try {
+      run.store.recordOutcome(run.taskId, this.bootId, outcome, outputs);
+      return run;
+    } catch (err) {
+      log.error(`[task] 无法持久化 ${run.taskId} 的 Agent 结果，将尽力直接发送:`, err);
+      const fallback = this.ephemeralRun(this.tasks.get(run.taskId)?.userId ?? '', outcome.generation);
+      fallback.store.markRunning(fallback.taskId, this.bootId, 'fallback');
+      fallback.store.recordOutcome(fallback.taskId, this.bootId, outcome, outputs);
+      return fallback;
+    }
+  }
+
+  private settleAborted(run: TaskRun): void {
+    // A shutdown abort is an interruption, not a user cancel: leave the phase so
+    // the next boot classifies it as recovery-required.
+    if (this.stopping) return;
+    try {
+      run.store.complete(run.taskId, 'cancelled');
+    } catch (err) {
+      log.error(`[task] 无法记录 ${run.taskId} 已取消:`, err);
+    }
+  }
+
+  /**
+   * Drive a delivery-pending (or recovery-required notice) task to the outbox.
+   * Every step is recorded, so a resume skips what is already durable.
+   */
+  private async deliverTask(uid: string, run: TaskRun): Promise<void> {
+    let task = run.store.get(run.taskId);
+    if (!task) return;
+    if (task.phase === 'delivery-pending' && task.outcome && !task.outputs) {
+      const files = task.outcome.kind === 'exec'
+        ? await this.deliverTaskFiles(uid, run, task.outcome)
+        : { sent: [], failed: [] };
+      task = run.store.setOutputs(run.taskId, this.buildOutputs(task.outcome, files));
+    }
+    await this.sendTaskOutputs(uid, run);
+    if (this.hasPendingTaskItems(uid, run)) {
+      // Output a previous runner already enqueued is still queued: drain the
+      // outbox (FIFO, quota- and receipt-aware) rather than enqueueing again.
+      const recoverPending = (this.ilink as ILinkClient & {
+        recoverPending?: (userId: string) => Promise<unknown>;
+      }).recoverPending;
+      await recoverPending?.call(this.ilink, uid);
+    }
+    this.settleDelivery(uid, run);
+  }
+
+  private hasPendingTaskItems(uid: string, run: TaskRun): boolean {
+    const task = run.store.get(run.taskId);
+    const itemIds = task ? this.taskItemIds(task) : new Set<string>();
+    if (itemIds.size === 0) return false;
+    return (this.deliveryStatus(uid)?.pending || []).some((item) => itemIds.has(item.itemId));
+  }
+
+  private async deliverTaskFiles(
+    uid: string,
+    run: TaskRun,
+    outcome: ExecDeliveryOutcome,
+  ): Promise<{ sent: string[]; failed: string[] }> {
+    let task = run.store.get(run.taskId)!;
+    if (!task.files) task = run.store.setFiles(run.taskId, this.extractSendFiles(uid, outcome.text));
+    const files = task.files || [];
+    const sent: string[] = [];
+    // Failures used to be log-only, so a file that never sent looked identical to a
+    // successful one from inside WeChat. Collect them and report back to the user.
+    const failed: string[] = [];
+    for (let index = 0; index < files.length; index++) {
+      let file = files[index];
+      if (file.state === 'sending') {
+        // A previous runner started this media send and never recorded the result.
+        // Media sends are not idempotent, so report instead of resending.
+        file = run.store.setFileState(run.taskId, index, 'unknown', '发送中断，无法确认是否已送达，未重发').files![index];
+      }
+      if (file.state === 'pending') {
+        if (!existsSync(file.path)) {
+          log.warn(`[SEND_FILE] 文件不存在: ${file.path}`);
+          file = run.store.setFileState(run.taskId, index, 'failed', '文件不存在').files![index];
+        } else {
+          run.store.setFileState(run.taskId, index, 'sending');
+          try {
+            const ext = file.path.split('.').pop()?.toLowerCase();
+            if (['jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp'].includes(ext || '')) {
+              await this.ilink.sendImage(uid, file.path);
+            } else if (['mp4', 'mov', 'avi', 'mkv', 'webm'].includes(ext || '')) {
+              await this.ilink.sendVideo(uid, file.path);
+            } else {
+              await this.ilink.sendFile(uid, file.path);
+            }
+            log.info(`[SEND_FILE] 已发送: ${file.path}`);
+            file = run.store.setFileState(run.taskId, index, 'sent').files![index];
+          } catch (err) {
+            log.error(`[SEND_FILE] 发送失败: ${file.path}`, err);
+            file = run.store.setFileState(run.taskId, index, 'failed', (err as Error).message || '未知错误').files![index];
+          }
+        }
+      }
+      if (file.state === 'sent') sent.push(file.baseName);
+      else failed.push(`${file.baseName}（${file.error || '未知错误'}）`);
+    }
+    return { sent, failed };
+  }
+
+  private extractSendFiles(uid: string, text: string): TaskFileStep[] {
+    const regex = sendFileMarkerRegex();
+    const workDir = this.sessions.get(uid).workDir || this.config.workDir;
+    const files: TaskFileStep[] = [];
+    let match;
+    while ((match = regex.exec(text)) !== null) {
+      let filePath = match[1].trim();
+      // 处理相对路径
+      if (!filePath.match(/^[A-Za-z]:/) && !filePath.startsWith('/')) {
+        filePath = join(workDir, filePath);
+      }
+      files.push({ path: filePath, baseName: filePath.split(/[\\/]/).pop() || filePath, state: 'pending' });
+    }
+    return files;
+  }
+
+  /** The exact message sequence the pre-#27 exec() sent after the Agent returned. */
+  private buildOutputs(outcome: DeliveryOutcome, files: { sent: string[]; failed: string[] }): TaskOutput[] {
+    if (outcome.kind === 'texts') {
+      return outcome.texts.map((text) => ({ ...text, enqueued: false }));
+    }
+    const outputs: TaskOutput[] = [];
+    const cleanText = outcome.text.replace(sendFileMarkerRegex(), '').trim();
+
+    // Send thinking content if enabled (only in compact mode, non-compact already streamed)
+    if (outcome.showThoughts && outcome.thinking && outcome.msgMode === 'compact') {
+      outputs.push({ text: `💭 思考:\n${outcome.thinking}\n\n---`, priority: 'intermediate', enqueued: false });
+    }
+
+    const sentNotice = [
+      files.sent.length > 0 ? `\n[已发送文件: ${files.sent.join(', ')}]` : '',
+      files.failed.length > 0 ? `\n[⚠️ 文件发送失败: ${files.failed.join('; ')}]` : '',
+    ].join('');
+
+    const activityOutputs = outcome.msgMode === 'normal' && outcome.finalActivityLines.length > 0
+      ? this.normalActivityOutputs(outcome.finalActivityLines)
+      : [];
+    outputs.push(...activityOutputs);
+
+    const finalActivityBlock = outcome.msgMode === 'normal' && outcome.finalActivityLines.length > 0 && activityOutputs.length === 0
+      ? `Activity\n${outcome.finalActivityLines.join('\n')}\n\n`
+      : '';
+    const meta = { tool: outcome.displayName, duration: outcome.duration, error: outcome.error };
+
+    // If text was already streamed, only send footer (avoid duplicate large-body resend).
+    if (outcome.hasStreamedText) {
+      const tailNotice = outcome.intermediateSendFailed
+        ? `${outcome.notice}[部分中间消息发送失败]${sentNotice}`
+        : `${outcome.notice}${sentNotice}`;
+      outputs.push({ text: formatResponse(`${finalActivityBlock}${tailNotice}`.trim(), meta), priority: 'final', enqueued: false });
+    } else {
+      // compact mode or no streamed text: send full result
+      outputs.push({
+        text: formatResponse(`${finalActivityBlock}${outcome.notice}${cleanText}${sentNotice}`, meta),
+        priority: 'final',
+        enqueued: false,
+      });
+    }
+    return outputs;
+  }
+
+  private async sendTaskOutputs(uid: string, run: TaskRun): Promise<void> {
+    const task = run.store.get(run.taskId);
+    if (!task?.outputs) return;
+    const generation = task.outcome?.generation ?? task.inbound.generation ?? run.generation;
+    const outputs = task.outputs;
+    for (let index = 0; index < outputs.length; index++) {
+      const output = outputs[index];
+      const memoKey = `${run.taskId}#${index}`;
+      const unrecorded = this.enqueuedNotRecorded.get(memoKey);
+      if (!output.enqueued && unrecorded) {
+        // The outbox already holds this output; only the ledger mark is missing.
+        try {
+          run.store.markOutputEnqueued(run.taskId, index, unrecorded);
+          this.enqueuedNotRecorded.delete(memoKey);
+        } catch (err) {
+          log.error(`[task] 仍无法记录 ${memoKey} 已入队:`, err);
+        }
+        continue;
+      }
+      if (!output.enqueued) {
+        let recorded = false;
+        const record = (itemIds: string[]): void => {
+          if (recorded) return;
+          recorded = true;
+          try {
+            run.store.markOutputEnqueued(run.taskId, index, itemIds);
+          } catch (err) {
+            // Never block or fail the send: the outbox has it. Remember it in memory so an
+            // in-process resume does not enqueue it again (restart reconciles from the outbox).
+            log.error(`[task] 输出已入队但无法记录 ${memoKey}:`, err);
+            this.enqueuedNotRecorded.set(memoKey, itemIds);
+          }
+        };
+        try {
+          const results = await this.ilink.sendText(uid, output.text, {
+            priority: output.priority,
+            generation,
+            itemIdPrefix: this.outputPrefix(run.taskId, index),
+            onEnqueued: (items) => record(items.map((item) => item.itemId)),
+          });
+          record(Array.isArray(results) ? results.map((result) => result.itemId) : []);
+        } catch (err) {
+          if (!isDeliveryFinalizationError(err)) throw err;
+          log.error(`[task:${output.priority}] 消息已确认，等待本地交付状态恢复:`, err);
+          record([]);
+        }
+        if (output.delayAfterMs && index < outputs.length - 1) await this.sleep(output.delayAfterMs);
+      }
+    }
+  }
+
+  /** delivery-pending → completed once every output left the outbox's pending queue. */
+  private settleDelivery(uid: string, run: TaskRun): void {
+    const task = run.store.get(run.taskId);
+    if (!task || task.phase !== 'delivery-pending' || !task.outputs) return;
+    if (task.outputs.some((output) => !output.enqueued)) return;
+    if (this.hasPendingTaskItems(uid, run)) return;
+    // Items that ended in the outbox's failure retention (#26) stay owned by the
+    // outbox (ambiguous ones are requeued on a later inbound); note them here.
+    const itemIds = this.taskItemIds(task);
+    const failed = (this.deliveryStatus(uid)?.failed || []).filter((item) => itemIds.has(item.itemId));
+    run.store.complete(run.taskId, 'delivered', failed.length > 0 ? `failed items: ${failed.map((item) => item.itemId).join(', ')}` : undefined);
+  }
+
+  private async handle(
+    msg: WeixinMessage,
+    text: string,
+    refText: string,
+    media?: DownloadedMedia[],
+    run?: TaskRun,
+  ): Promise<void> {
+    const uid = msg.from_user_id;
+    if (!this.isAllowed(uid)) return;
     const deliveryClient = this.ilink as ILinkClient & {
-      getDeliveryStatus?: (userId: string) => { quota: { generation: number }; pending: unknown[] };
       recoverPending?: (userId: string) => Promise<unknown>;
     };
-    const deliveryStatus = deliveryClient.getDeliveryStatus?.call(this.ilink, uid);
-    const taskGeneration = deliveryStatus?.quota.generation;
+    const deliveryStatus = this.deliveryStatus(uid);
+    const taskGeneration = run ? run.generation : deliveryStatus?.quota.generation;
 
     const trimmed = text.trim();
 
     // Any fresh inbound may be the user's request to resume durable output.
     // The exact bare command is consumed; all other text continues normally.
     const recoverPending = deliveryClient.recoverPending;
-    if (trimmed === '继续' && recoverPending && deliveryStatus?.pending.length) {
+    // Owed task output counts too: an output that never reached the outbox (e.g. a
+    // failed enqueue) leaves `pending` empty, but 继续 must still only resume delivery.
+    const owesOutbox = Boolean(deliveryStatus?.pending?.length);
+    if (trimmed === '继续' && (owesOutbox || this.hasOwedTaskDelivery(uid, run?.taskId))) {
       const stopTyping = await this.ilink.startTyping(uid);
       try {
-        await recoverPending.call(this.ilink, uid);
+        await recoverPending?.call(this.ilink, uid);
       } catch (err) {
         log.error(`[delivery] 恢复 ${uid} 的排队消息失败:`, err);
+      }
+      try {
+        await this.resumeUserTasks(uid, run?.taskId);
       } finally {
         stopTyping();
       }
@@ -258,6 +792,7 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
         log.error(`[delivery] 恢复 ${uid} 的排队消息失败:`, err);
       }
     }
+    void this.resumeUserTasks(uid, run?.taskId);
 
     // Build media context for CLI
     let mediaContext = '';
@@ -271,7 +806,7 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
 
     // ── /command ──
     if (trimmed.startsWith('/')) {
-      await this.handleSlash(uid, trimmed, taskGeneration);
+      await this.handleSlash(uid, trimmed, taskGeneration, run);
       return;
     }
 
@@ -286,7 +821,7 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
       if (t1 && t2 && this.registry.isAvailable(t1) && this.registry.isAvailable(t2)) {
         const busy = [t1, t2].find(t => this.active.has(`${uid}:${t}`));
         if (busy) { await this.ilink.sendText(uid, `${busy} 在忙`); return; }
-        await this.chain(uid, t1, t2, prompt + mediaContext, media, taskGeneration);
+        await this.chain(uid, t1, t2, prompt + mediaContext, media, taskGeneration, run);
         return;
       }
     }
@@ -305,7 +840,7 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
       this.sessions.update(uid, { defaultTool: toolName });
       if (this.active.has(`${uid}:${toolName}`)) { await this.ilink.sendText(uid, `${toolName} 在忙`); return; }
       const fullPrompt = `以下是 ${prev.tool} 的输出:\n\n${prev.text}\n\n---\n\n${prompt}${mediaContext}`;
-      await this.exec(uid, toolName, fullPrompt, media, taskGeneration);
+      await this.exec(uid, toolName, fullPrompt, media, taskGeneration, run);
       return;
     }
 
@@ -346,12 +881,12 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
 
     const prompt = atMatch ? atMatch[2].trim() : trimmed;
     const combined = [prompt, refText].filter(Boolean).join('\n\n') + mediaContext;
-    await this.exec(uid, toolName, combined, media, taskGeneration);
+    await this.exec(uid, toolName, combined, media, taskGeneration, run);
   }
 
   // ─── /command → ALL are commands, never pass through ────
 
-  private async handleSlash(uid: string, text: string, taskGeneration?: number): Promise<boolean> {
+  private async handleSlash(uid: string, text: string, taskGeneration?: number, run?: TaskRun): Promise<boolean> {
     const parts = text.substring(1).split(/\s+/);
     const cmd = parts[0].toLowerCase();
     const arg = parts.slice(1).join(' ').trim();
@@ -409,6 +944,7 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
           '/new  新会话',
           '/clear  清除所有',
           '/cancel  取消任务',
+          '/tasks [ack]  查看/确认中断的任务',
           '/fork  分支当前会话',
           '/resume  查看保存的会话',
           '',
@@ -459,6 +995,11 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
           const backoff = delivery.quota.rateBackoffUntil > Date.now() ? 'backoff' : 'ready';
           lines.push(`delivery: pending=${delivery.pending.length} failed=${delivery.failed.length} sent=${delivery.quota.sentItems}/${delivery.quota.maxItemsPerWindow} remaining=${delivery.quota.remainingItems} ${backoff}`);
         }
+        const openTasks = this.tasks.list({ userId: uid, phases: ['delivery-pending', 'recovery-required'] });
+        if (openTasks.length > 0) {
+          const count = (phase: string) => openTasks.filter((task) => task.phase === phase).length;
+          lines.push(`tasks: delivery-pending=${count('delivery-pending')} recovery-required=${count('recovery-required')} (/tasks)`);
+        }
         await reply(lines.join('\n'));
         return true;
       }
@@ -490,6 +1031,30 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
           tasks.forEach(([k, t]) => { if (!seen.has(t.abort)) { seen.add(t.abort); t.abort.abort(); } this.active.delete(k); });
           await reply(`已取消 ${[...new Set(tasks.map(([, t]) => t.tool))].join(', ')}`);
         } else { await reply('无任务'); }
+        return true;
+      }
+
+      case 'tasks': {
+        const recovery = this.tasks.list({ userId: uid, phases: ['recovery-required'] });
+        if (arg === 'ack' || arg === 'clear') {
+          for (const task of recovery) this.tasks.complete(task.taskId, 'operator-acknowledged');
+          await reply(recovery.length > 0 ? `已确认 ${recovery.length} 个中断任务` : '没有需要确认的中断任务');
+          return true;
+        }
+        const open = this.tasks.list({
+          userId: uid,
+          phases: ['received', 'dispatching', 'running', 'delivery-pending', 'recovery-required'],
+        }).filter((task) => task.taskId !== run?.taskId);
+        if (open.length === 0) { await reply('没有未完成的任务'); return true; }
+        const lines = open.map((task) => {
+          const snippet = task.inbound.text.length > 40 ? `${task.inbound.text.slice(0, 40)}…` : task.inbound.text;
+          const when = new Date(task.createdAt).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false });
+          const parts = [`[${task.phase}] ${when} ${snippet}`];
+          if (task.agent) parts.push(`  agent: ${task.agent.tool}`);
+          if (task.recovery) parts.push(`  原因: ${task.recovery.reason} — ${task.recovery.detail}`);
+          return parts.join('\n');
+        });
+        await reply(`未完成任务 (${open.length}):\n\n${lines.join('\n\n')}${recovery.length > 0 ? '\n\n/tasks ack 确认已处理中断任务' : ''}`);
         return true;
       }
 
@@ -815,7 +1380,7 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
       case 'diff': {
         const tool = settings.defaultTool || this.config.defaultTool;
         if (this.registry.isAvailable(tool)) {
-          await this.exec(uid, tool, arg || 'Show the current git diff of uncommitted changes. Be concise.', undefined, taskGeneration);
+          await this.exec(uid, tool, arg || 'Show the current git diff of uncommitted changes. Be concise.', undefined, taskGeneration, run);
         }
         return true;
       }
@@ -823,7 +1388,7 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
       case 'commit': {
         const tool = settings.defaultTool || this.config.defaultTool;
         if (this.registry.isAvailable(tool)) {
-          await this.exec(uid, tool, arg || 'Create a git commit for all staged changes with an appropriate commit message.', undefined, taskGeneration);
+          await this.exec(uid, tool, arg || 'Create a git commit for all staged changes with an appropriate commit message.', undefined, taskGeneration, run);
         }
         return true;
       }
@@ -831,7 +1396,7 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
       case 'review': {
         const tool = settings.defaultTool || this.config.defaultTool;
         if (this.registry.isAvailable(tool)) {
-          await this.exec(uid, tool, arg || 'Review the current code changes (git diff) and provide feedback on quality, bugs, and improvements.', undefined, taskGeneration);
+          await this.exec(uid, tool, arg || 'Review the current code changes (git diff) and provide feedback on quality, bugs, and improvements.', undefined, taskGeneration, run);
         }
         return true;
       }
@@ -840,7 +1405,7 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
         const tool = settings.defaultTool || this.config.defaultTool;
         const file = tool === 'codex' ? 'AGENTS.md' : tool === 'gemini' ? 'GEMINI.md' : 'CLAUDE.md';
         if (this.registry.isAvailable(tool)) {
-          await this.exec(uid, tool, arg || `Analyze this project and create a ${file} configuration file with appropriate instructions.`, undefined, taskGeneration);
+          await this.exec(uid, tool, arg || `Analyze this project and create a ${file} configuration file with appropriate instructions.`, undefined, taskGeneration, run);
         }
         return true;
       }
@@ -866,7 +1431,7 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
       case 'files': {
         const tool = settings.defaultTool || this.config.defaultTool;
         if (this.registry.isAvailable(tool)) {
-          await this.exec(uid, tool, 'List all files in the current working directory. Show the tree structure concisely.', undefined, taskGeneration);
+          await this.exec(uid, tool, 'List all files in the current working directory. Show the tree structure concisely.', undefined, taskGeneration, run);
         }
         return true;
       }
@@ -905,7 +1470,7 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
           // /plan <description> → send plan request to tool
           const tool = settings.defaultTool || this.config.defaultTool;
           if (this.registry.isAvailable(tool)) {
-            await this.exec(uid, tool, `Create a detailed plan for: ${arg}. Only plan, do not execute.`, undefined, taskGeneration);
+            await this.exec(uid, tool, `Create a detailed plan for: ${arg}. Only plan, do not execute.`, undefined, taskGeneration, run);
           }
         } else {
           // /plan with no args → switch to plan mode
@@ -1154,6 +1719,7 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
     prompt: string,
     media?: DownloadedMedia[],
     taskGeneration?: number,
+    run?: TaskRun,
   ): Promise<void> {
     const adapter1 = this.registry.get(tool1);
     const adapter2 = this.registry.get(tool2);
@@ -1164,54 +1730,71 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
     this.active.set(`${uid}:${tool2}`, { abort, tool: `${tool1}>${tool2}` });
     const stopTyping = await this.ilink.startTyping(uid);
     const start = Date.now();
+    run ??= this.ephemeralRun(uid, taskGeneration);
 
     try {
-      // Step 1: run tool1
-      log.debug(`[chain] step1: ${tool1}`);
-      const { result: r1, notice: n1 } = await this.runOnce(tool1, uid, prompt, abort.signal, media);
+      run.store.markRunning(run.taskId, this.bootId, `${tool1}>${tool2}`);
+      let outcome: DeliveryOutcome;
+      try {
+        // Step 1: run tool1
+        log.debug(`[chain] step1: ${tool1}`);
+        const { result: r1, notice: n1 } = await this.runOnce(tool1, uid, prompt, abort.signal, media);
 
-      if (abort.signal.aborted || r1.error) {
-        if (!abort.signal.aborted) {
-          await this.ilink.sendText(uid, formatResponse(n1 + r1.text, { tool: adapter1.displayName, error: true }), {
-            priority: 'final', generation: taskGeneration,
-          });
+        if (abort.signal.aborted) { this.settleAborted(run); return; }
+        if (r1.error) {
+          outcome = {
+            kind: 'texts',
+            texts: [{ text: formatResponse(n1 + r1.text, { tool: adapter1.displayName, error: true }), priority: 'final' }],
+            generation: taskGeneration,
+          };
+        } else {
+          if (r1.sessionId && adapter1.capabilities.sessionResume) {
+            this.sessions.setSession(uid, tool1, r1.sessionId);
+          }
+
+          // Step 2: run tool2 with tool1's output as context
+          log.debug(`[chain] step2: ${tool2}`);
+          const chainPrompt = `以下是 ${adapter1.displayName} 对「${prompt}」的分析结果:\n\n${r1.text}\n\n---\n\n请基于以上内容继续工作。`;
+
+          const { result: r2, notice: n2 } = await this.runOnce(tool2, uid, chainPrompt, abort.signal);
+
+          if (abort.signal.aborted) { this.settleAborted(run); return; }
+
+          if (r2.sessionId && adapter2.capabilities.sessionResume) {
+            this.sessions.setSession(uid, tool2, r2.sessionId);
+          }
+
+          this.sessions.update(uid, { defaultTool: tool2 });
+          this.lastResponse.set(uid, { tool: adapter2.displayName, text: r2.text });
+
+          const elapsed = Date.now() - start;
+          outcome = {
+            kind: 'texts',
+            texts: [{
+              text: formatResponse(n2 + r2.text, {
+                tool: `${adapter1.displayName} → ${adapter2.displayName}`,
+                duration: elapsed,
+                error: r2.error,
+              }),
+              priority: 'final',
+            }],
+            generation: taskGeneration,
+          };
         }
-        return;
-      }
-
-      if (r1.sessionId && adapter1.capabilities.sessionResume) {
-        this.sessions.setSession(uid, tool1, r1.sessionId);
-      }
-
-      // Step 2: run tool2 with tool1's output as context
-      log.debug(`[chain] step2: ${tool2}`);
-      const chainPrompt = `以下是 ${adapter1.displayName} 对「${prompt}」的分析结果:\n\n${r1.text}\n\n---\n\n请基于以上内容继续工作。`;
-
-      const { result: r2, notice: n2 } = await this.runOnce(tool2, uid, chainPrompt, abort.signal);
-
-      if (abort.signal.aborted) return;
-
-      if (r2.sessionId && adapter2.capabilities.sessionResume) {
-        this.sessions.setSession(uid, tool2, r2.sessionId);
-      }
-
-      this.sessions.update(uid, { defaultTool: tool2 });
-      this.lastResponse.set(uid, { tool: adapter2.displayName, text: r2.text });
-
-      const elapsed = Date.now() - start;
-      await this.ilink.sendText(uid, formatResponse(n2 + r2.text, {
-        tool: `${adapter1.displayName} → ${adapter2.displayName}`,
-        duration: elapsed,
-        error: r2.error,
-      }), { priority: 'final', generation: taskGeneration });
-    } catch (err: unknown) {
-      if (!abort.signal.aborted) {
+      } catch (err: unknown) {
+        if (abort.signal.aborted) { this.settleAborted(run); return; }
         log.error(`[chain] 失败:`, err);
-        if (!isDeliveryFinalizationError(err)) {
-          await this.ilink.sendText(uid, `链式调用失败: ${(err as Error).message}`, {
-            priority: 'final', generation: taskGeneration,
-          });
-        }
+        outcome = {
+          kind: 'texts',
+          texts: [{ text: `链式调用失败: ${(err as Error).message}`, priority: 'final' }],
+          generation: taskGeneration,
+        };
+      }
+      const deliveryRun = this.commitOutcome(run, outcome);
+      try {
+        await this.deliverTask(uid, deliveryRun);
+      } catch (err) {
+        log.error(`[chain] 交付暂停，等待下次入站或重启后继续:`, err);
       }
     } finally {
       stopTyping();
@@ -1325,6 +1908,7 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
     prompt: string,
     media?: DownloadedMedia[],
     taskGeneration?: number,
+    run?: TaskRun,
   ): Promise<void> {
     const adapter = this.registry.get(toolName);
     if (!adapter) return;
@@ -1338,6 +1922,7 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
     taskGeneration ??= (this.ilink as ILinkClient & {
       getDeliveryStatus?: (userId: string) => { quota: { generation: number } };
     }).getDeliveryStatus?.call(this.ilink, uid)?.quota.generation;
+    run ??= this.ephemeralRun(uid, taskGeneration);
 
     // Track if we've streamed text (to avoid duplicate with final result)
     let hasStreamedText = false;
@@ -1426,7 +2011,7 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
           break;
         case 'text': {
           // Markers must not reach WeChat: the final text gets them stripped by
-          // parseAndSendFiles, but streamed chunks never pass through it.
+          // buildOutputs, but streamed chunks never pass through it.
           const visible = content ? stripSendFileMarkers(content) : '';
           if (visible) {
             hasStreamedText = true;
@@ -1447,72 +2032,58 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
     } : undefined;
 
     try {
-      const { result, notice } = await this.runOnce(toolName, uid, prompt, abort.signal, media, onIntermediate);
+      // Durable boundary: the adapter is only invoked after the task says `running`.
+      run.store.markRunning(run.taskId, this.bootId, toolName);
+      let outcome: DeliveryOutcome;
+      try {
+        const { result, notice } = await this.runOnce(toolName, uid, prompt, abort.signal, media, onIntermediate);
 
-      // Ensure all buffered intermediate content is emitted before final response.
-      flushTextBatch();
-      flushActivityBatch();
-      await sendQueue;
+        // Ensure all buffered intermediate content is emitted before final response.
+        flushTextBatch();
+        flushActivityBatch();
+        await sendQueue;
 
-      if (abort.signal.aborted) return;
+        if (abort.signal.aborted) { this.settleAborted(run); return; }
 
-      if (result.sessionId && adapter.capabilities.sessionResume) {
-        this.sessions.setSession(uid, toolName, result.sessionId);
-      }
+        if (result.sessionId && adapter.capabilities.sessionResume) {
+          this.sessions.setSession(uid, toolName, result.sessionId);
+        }
 
-      // Parse [SEND_FILE: path] markers and send files
-      const { text: cleanText, sentFiles, failedFiles } = await this.parseAndSendFiles(uid, result.text);
+        // Store for >> relay; auto-switch defaultTool to last used tool
+        this.lastResponse.set(uid, { tool: adapter.displayName, text: result.text.replace(sendFileMarkerRegex(), '').trim() });
+        this.sessions.update(uid, { defaultTool: toolName });
 
-      // Store for >> relay; auto-switch defaultTool to last used tool
-      this.lastResponse.set(uid, { tool: adapter.displayName, text: cleanText });
-      this.sessions.update(uid, { defaultTool: toolName });
-
-      // Send thinking content if enabled (only in compact mode, non-compact already streamed)
-      if (settings.showThoughts && result.thinking && msgMode === 'compact') {
-        await this.sendTextAfterConfirmation(uid, `💭 思考:\n${result.thinking}\n\n---`, {
-          priority: 'intermediate',
+        outcome = {
+          kind: 'exec',
+          toolName,
+          displayName: adapter.displayName,
+          msgMode,
+          showThoughts: Boolean(settings.showThoughts),
+          text: result.text,
+          ...(result.thinking ? { thinking: result.thinking } : {}),
+          error: result.error,
+          duration: result.duration || (Date.now() - start),
+          notice,
+          hasStreamedText,
+          intermediateSendFailed,
+          finalActivityLines: [...finalActivityLines],
           generation: taskGeneration,
-        }, `${toolName}:thinking`);
-      }
-
-      const sentNotice = [
-        sentFiles.length > 0 ? `\n[已发送文件: ${sentFiles.join(', ')}]` : '',
-        failedFiles.length > 0 ? `\n[⚠️ 文件发送失败: ${failedFiles.join('; ')}]` : '',
-      ].join('');
-
-      const splitActivitySent = msgMode === 'normal' && finalActivityLines.length > 0
-        ? await this.sendNormalActivityBatches(uid, finalActivityLines, taskGeneration)
-        : false;
-
-      const finalActivityBlock = msgMode === 'normal' && finalActivityLines.length > 0 && !splitActivitySent
-        ? `Activity\n${finalActivityLines.join('\n')}\n\n`
-        : '';
-
-      // If text was already streamed, only send footer (avoid duplicate large-body resend).
-      if (hasStreamedText) {
-        const tailNotice = intermediateSendFailed
-          ? `${notice}[部分中间消息发送失败]${sentNotice}`
-          : `${notice}${sentNotice}`;
-        await this.sendTextAfterConfirmation(uid, formatResponse(`${finalActivityBlock}${tailNotice}`.trim(), {
-          tool: adapter.displayName,
-          duration: result.duration || (Date.now() - start),
-          error: result.error,
-        }), { priority: 'final', generation: taskGeneration }, `${toolName}:final`);
-      } else {
-        // compact mode or no streamed text: send full result
-        await this.sendTextAfterConfirmation(uid, formatResponse(`${finalActivityBlock}${notice}${cleanText}${sentNotice}`, {
-          tool: adapter.displayName,
-          duration: result.duration || (Date.now() - start),
-          error: result.error,
-        }), { priority: 'final', generation: taskGeneration }, `${toolName}:final`);
-      }
-    } catch (err: unknown) {
-      if (!abort.signal.aborted) {
+        };
+      } catch (err: unknown) {
+        if (abort.signal.aborted) { this.settleAborted(run); return; }
         log.error(`[${toolName}] 失败:`, err);
-        await this.sendTextAfterConfirmation(uid, `失败: ${(err as Error).message}`, {
-          priority: 'final',
+        outcome = {
+          kind: 'texts',
+          texts: [{ text: `失败: ${(err as Error).message}`, priority: 'final' }],
           generation: taskGeneration,
-        }, `${toolName}:failure`);
+        };
+      }
+      // From here on the outcome is durable: replay or restart only resumes delivery.
+      const deliveryRun = this.commitOutcome(run, outcome);
+      try {
+        await this.deliverTask(uid, deliveryRun);
+      } catch (err) {
+        log.error(`[${toolName}] 交付暂停，等待下次入站或重启后继续:`, err);
       }
     } finally {
       // Defensive cleanup for pending timer when task exits early.
@@ -1521,55 +2092,8 @@ const noTrailingSlash = unquoted.replace(/\/+$/, '');
       this.active.delete(`${uid}:${toolName}`);
     }
   }
+}
 
-  private async parseAndSendFiles(
-    uid: string,
-    text: string,
-  ): Promise<{ text: string; sentFiles: string[]; failedFiles: string[] }> {
-    const { existsSync } = await import('node:fs');
-    const sentFiles: string[] = [];
-    // Failures used to be log-only, so a file that never sent looked identical to a
-    // successful one from inside WeChat. Collect them and report back to the user.
-    const failedFiles: string[] = [];
-    const regex = sendFileMarkerRegex();
-    let match;
-    const workDir = this.sessions.get(uid).workDir || this.config.workDir;
-
-    while ((match = regex.exec(text)) !== null) {
-      let filePath = match[1].trim();
-      
-      // 处理相对路径
-      if (!filePath.match(/^[A-Za-z]:/) && !filePath.startsWith('/')) {
-        filePath = join(workDir, filePath);
-      }
-
-      const baseName = filePath.split(/[\\/]/).pop() || filePath;
-
-      try {
-        if (!existsSync(filePath)) {
-          log.warn(`[SEND_FILE] 文件不存在: ${filePath}`);
-          failedFiles.push(`${baseName}（文件不存在）`);
-          continue;
-        }
-
-        const ext = filePath.split('.').pop()?.toLowerCase();
-        if (['jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp'].includes(ext || '')) {
-          await this.ilink.sendImage(uid, filePath);
-        } else if (['mp4', 'mov', 'avi', 'mkv', 'webm'].includes(ext || '')) {
-          await this.ilink.sendVideo(uid, filePath);
-        } else {
-          await this.ilink.sendFile(uid, filePath);
-        }
-        sentFiles.push(baseName);
-        log.info(`[SEND_FILE] 已发送: ${filePath}`);
-      } catch (err) {
-        log.error(`[SEND_FILE] 发送失败: ${filePath}`, err);
-        failedFiles.push(`${baseName}（${(err as Error).message || '未知错误'}）`);
-      }
-    }
-
-    // 移除标记
-    const cleanText = text.replace(sendFileMarkerRegex(), '').trim();
-    return { text: cleanText, sentFiles, failedFiles };
-  }
+function errorMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
 }
