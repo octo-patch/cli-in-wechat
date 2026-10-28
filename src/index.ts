@@ -4,6 +4,7 @@ import { ILinkClient } from './ilink/client.js';
 import { AdapterRegistry } from './adapters/registry.js';
 import { SessionManager } from './bridge/session.js';
 import { Router } from './bridge/router.js';
+import { InboundTaskStore } from './bridge/task-store.js';
 import {
   loadConfig,
   loadCredentials,
@@ -51,7 +52,7 @@ async function main() {
   // ─── 1. Detect CLI tools ─────────────────────────────
 
   log.info('检测已安装的 CLI 工具...');
-  const registry = new AdapterRegistry();
+  const registry = new AdapterRegistry(config.agents);
   await registry.detectAvailable();
 
   const available = registry.getAvailableNames();
@@ -114,7 +115,9 @@ async function main() {
     return ilink.sendText(value.userId, value.text);
   });
   const sessions = new SessionManager();
-  const router = new Router(ilink, registry, sessions, config);
+  // An unusable ledger is preserved aside and logged by the store; the bridge starts empty.
+  const taskStore = new InboundTaskStore(join(DATA_DIR, 'inbound-tasks.json'));
+  const router = new Router(ilink, registry, sessions, config, { taskStore });
 
   // Self-heal on session expiry (errcode -14/-13): re-run QR login instead of crashing.
   ilink.setReloginHandler(async () => {
@@ -140,6 +143,7 @@ async function main() {
     log.info(`收到 ${signal}，正在关闭...`);
     try { router.stop(); } catch { /* ignore */ }
     try { ilink.stop(); } catch { /* ignore */ }
+    try { registry.shutdown(); } catch { /* ignore */ }
     void releaseInstance?.();
     releaseInstance = null;
     // Give in-flight aborts (child SIGTERM/taskkill) a brief moment, then exit.
@@ -161,6 +165,7 @@ async function main() {
       shuttingDown = true;
       try { router.stop(); } catch { /* ignore */ }
       try { ilink.stop(); } catch { /* ignore */ }
+      try { registry.shutdown(); } catch { /* ignore */ }
       void releaseInstance?.();
       releaseInstance = null;
     }

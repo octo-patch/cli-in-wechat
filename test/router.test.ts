@@ -6,6 +6,10 @@ import { syncBuiltinESMExports } from 'node:module';
 import { Router, createSendFileMarkerStripper } from '../src/bridge/router.js';
 import { DeliveryFinalizationError } from '../src/ilink/client.js';
 import { DEFAULT_SETTINGS } from '../src/adapters/base.js';
+import { CodexAdapter, type CodexSpawn } from '../src/adapters/codex.js';
+import { EventEmitter } from 'node:events';
+import { PassThrough } from 'node:stream';
+import type { ChildProcess } from 'node:child_process';
 import type { BridgeConfig } from '../src/config.js';
 import type { WeixinMessage } from '../src/ilink/types.js';
 
@@ -41,6 +45,11 @@ function createRouter() {
     isAvailable: (name: string) => ['claude', 'codex', 'gemini'].includes(name),
     getNameByDisplayName: (displayName: string) => ({ Claude: 'claude', Codex: 'codex', Gemini: 'gemini' }[displayName]),
     getAvailableNames: () => ['claude', 'codex', 'gemini'],
+    getAll: () => [
+      { name: 'claude', displayName: 'Claude' },
+      { name: 'codex', displayName: 'Codex' },
+      { name: 'gemini', displayName: 'Gemini' },
+    ],
     get: (name: string) => ({
       name,
       displayName: name === 'claude' ? 'Claude' : name === 'codex' ? 'Codex' : 'Gemini',
@@ -107,14 +116,14 @@ function makeMessage(uid: string): WeixinMessage {
   };
 }
 
-test('/models shows current MiniMax choices without resetting saved or explicit legacy models', async (t) => {
+test('/models prioritizes current MiniMax choices without hiding newer or legacy models', async (t) => {
   const { router, sessions, messages } = createRouter();
   const saved = 'minimax/MiniMax-M2.7';
   await router.handleSlash('u1', `/model ${saved}`);
   t.mock.method(childProcess, 'execSync', (command: string, options: { cwd: string }) => {
     assert.equal(command, 'opencode models');
     assert.equal(options.cwd, process.cwd());
-    return 'minimax/MiniMax-M2.7\nminimax/MiniMax-M3\nother/model\nminimax/MiniMax-M3.1-Flash\n';
+    return 'minimax/MiniMax-M2.7\nminimax/MiniMax-M4\nminimax/MiniMax-M3\nother/model\nminimax/MiniMax-M3.1-Flash\n';
   });
   syncBuiltinESMExports();
   t.after(() => { t.mock.restoreAll(); syncBuiltinESMExports(); });
@@ -122,7 +131,8 @@ test('/models shows current MiniMax choices without resetting saved or explicit 
   const displayed = messages.at(-1)!.text;
   assert.ok(displayed.indexOf('MiniMax-M3.1-Flash') < displayed.indexOf('MiniMax-M3\n'));
   assert.ok(displayed.includes('other/model'));
-  assert.ok(!displayed.includes('MiniMax-M2.7'));
+  assert.ok(displayed.includes('MiniMax-M2.7'));
+  assert.ok(displayed.includes('MiniMax-M4'));
   assert.equal((sessions.get('u1') as any).model, saved);
   await router.handleSlash('u1', '/model custom/model');
   assert.equal((sessions.get('u1') as any).model, 'custom/model');
@@ -160,17 +170,13 @@ test('getCli fallback to refText if no @tool mention', () => {
   assert.equal(tool, 'claude');
 });
 
-test('pending question resolution follows getCli-selected tool', async () => {
+test('a waiting question takes the next reply instead of starting a new agent run', async () => {
   const { router, sessions } = createRouter();
   sessions.update('u1', { defaultTool: 'gemini' });
 
-  let resolvedAnswer = '';
-  router.pendingQuestions.set('u1:codex', {
-    resolve: (answer: string) => {
-      resolvedAnswer = answer;
-    },
-    timeout: setTimeout(() => {}, 1000),
-    toolName: 'codex',
+  // Questions are queued per user (not per tool), so the reply needs no @tool routing.
+  const answer = router.askUserViaWeChat('u1', 'codex', {
+    questions: [{ question: 'Pick', options: [{ label: 'a' }, { label: 'b' }] }],
   });
 
   let execCalled = false;
@@ -178,11 +184,11 @@ test('pending question resolution follows getCli-selected tool', async () => {
     execCalled = true;
   };
 
-  await router.handle(makeMessage('u1'), '@codex 2', 'question body\n— Claude | 等待回复');
+  await router.handle(makeMessage('u1'), '2', 'question body\n— Claude | 等待回复');
 
-  assert.equal(resolvedAnswer, '@codex 2');
+  assert.deepEqual(await answer, { Pick: 'b' });
   assert.equal(execCalled, false);
-  assert.equal(router.pendingQuestions.has('u1:codex'), false);
+  assert.equal(router.interactions.size, 0);
 });
 
 test('handle() rejects unknown @tool mention', async () => {
@@ -406,6 +412,55 @@ test('compact normal and verbose preserve delivery content order and priorities'
   }
 });
 
+function codexJsonlSpawn(stdoutText: string): CodexSpawn {
+  return () => {
+    const child = new EventEmitter() as unknown as ChildProcess;
+    const stdin = new PassThrough();
+    const stdout = new PassThrough();
+    const stderr = new PassThrough();
+    stdin.resume();
+    Object.assign(child, { stdin, stdout, stderr, killed: false, exitCode: null, pid: 4244, kill: () => true });
+    queueMicrotask(() => {
+      stdout.end(stdoutText);
+      stderr.end();
+      setImmediate(() => { Object.assign(child, { exitCode: 0 }); child.emit('close', 0, null); });
+    });
+    return child;
+  };
+}
+
+test('codex final answer is delivered exactly once after earlier text was streamed', async (t) => {
+  const stdoutText = [
+    { type: 'thread.started', thread_id: 'thr_router' },
+    { type: 'turn.started' },
+    { type: 'item.completed', item: { id: 'm1', type: 'agent_message', text: 'Let me look first.' } },
+    { type: 'item.started', item: { id: 'c1', type: 'command_execution', command: 'ls', status: 'in_progress' } },
+    { type: 'item.completed', item: { id: 'c1', type: 'command_execution', command: 'ls', exit_code: 0, status: 'completed' } },
+    { type: 'item.completed', item: { id: 'm2', type: 'agent_message', text: 'FINAL-ANSWER-42' } },
+    { type: 'turn.completed', usage: { input_tokens: 1, output_tokens: 1 } },
+  ].map((e) => JSON.stringify(e)).join('\n') + '\n';
+
+  for (const mode of ['compact', 'normal', 'verbose'] as const) {
+    await t.test(mode, async () => {
+      const { router, sessions, messages } = createRouter();
+      sessions.update('u1', { msgMode: mode } as any);
+      const adapter = new CodexAdapter(codexJsonlSpawn(stdoutText));
+      (router as any).registry.get = () => adapter;
+
+      await router.exec('u1', 'codex', 'hello');
+
+      const all = messages.map((m) => m.text).join('\n---\n');
+      assert.equal(all.split('FINAL-ANSWER-42').length - 1, 1, `final answer must appear exactly once:\n${all}`);
+      if (mode === 'compact') {
+        assert.equal(messages.length, 1);
+        assert.doesNotMatch(all, /Let me look first/);
+      } else {
+        assert.equal(all.split('Let me look first.').length - 1, 1);
+      }
+    });
+  }
+});
+
 test('exec does not send a failure bubble after confirmed delivery bookkeeping fails', async () => {
   const { router, ilink } = createRouter();
   const attempts: string[] = [];
@@ -544,12 +599,12 @@ test('exec maps stale default-alias model to empty before adapter execution', as
 // Bug: update() mutates the live settings ref, so reading settings.<flag> after update()
 // reported the inverted state. These assert the reply text matches what was actually stored.
 
+// The old one-word toggles now forward to /set (0.2.0); bare /set <key> still toggles.
 for (const { cmd, field, on } of [
-  { cmd: 'verbose', field: 'verbose', on: 'ON' },
   { cmd: 'search', field: 'search', on: 'ON' },
   { cmd: 'ephemeral', field: 'ephemeral', on: 'ON' },
-  { cmd: 'thinking', field: 'thinking', on: 'ON (深度思考)' },
-  { cmd: 'bare', field: 'bare', on: 'ON (跳过配置加载)' },
+  { cmd: 'bare', field: 'bare', on: 'ON' },
+  { cmd: 'set thoughts', field: 'showThoughts', on: 'ON' },
 ]) {
   test(`/${cmd} toggle reports the value it actually stored (on then off)`, async () => {
     const { router, sessions, messages } = createRouter();

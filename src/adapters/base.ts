@@ -82,6 +82,16 @@ export interface AskUserRequest {
   }>;
 }
 
+/** A tool-permission prompt raised by an agent (today: ACP `session/request_permission`). */
+export interface PermissionRequest {
+  /** Human-readable description of the tool call, e.g. "Run `npm test`". */
+  title: string;
+  /** Tool kind when the agent reports one (read / edit / execute / fetch …). */
+  kind?: string;
+  /** Choices offered by the agent; `kind` is allow_once | allow_always | reject_once | reject_always. */
+  options: Array<{ id: string; name: string; kind: string }>;
+}
+
 export interface ExecOptions {
   settings: UserSettings;
   workDir?: string;
@@ -89,6 +99,9 @@ export interface ExecOptions {
   extraArgs?: string[];
   signal?: AbortSignal;
   askUser?: (req: AskUserRequest) => Promise<Record<string, string>>;
+  /** Ask the user to approve a tool call in `safe` mode. Resolves to the chosen option id, or
+   *  null to reject. When absent, adapters reject on their own (and say so in the reply). */
+  requestPermission?: (req: PermissionRequest, signal?: AbortSignal) => Promise<string | null>;
   media?: DownloadedMedia[];
   /** Callback for streaming intermediate messages to WeChat */
   onIntermediate?: (msg: IntermediateMessage) => void;
@@ -99,6 +112,8 @@ export interface ExecResult {
   thinking?: string;
   sessionId?: string;
   cost?: number;
+  /** Token usage reported by the CLI for this run, when it reports one. */
+  usage?: { inputTokens: number; outputTokens: number; cacheReadTokens?: number; cacheWriteTokens?: number };
   duration?: number;
   error?: boolean;
   /** Set by the adapter when the error is positively identified as a session/resume failure. */
@@ -120,6 +135,8 @@ export interface AdapterCapabilities {
   hasModel: boolean;
   hasSearch: boolean;
   hasBudget: boolean;
+  /** Calls `ExecOptions.requestPermission` in `safe` mode (approvals are asked in WeChat). */
+  approvals?: boolean;
 }
 
 export interface CLIAdapter {
@@ -129,6 +146,8 @@ export interface CLIAdapter {
   readonly capabilities: AdapterCapabilities;
   isAvailable(): Promise<boolean>;
   execute(prompt: string, opts: ExecOptions): Promise<ExecResult>;
+  /** Release any long-lived resources (e.g. spawned background servers) on shutdown. */
+  close?(): void;
 }
 
 // ─── Shared process helpers ────────────────────────────────
@@ -190,23 +209,44 @@ function resolveWinDirectTarget(command: string): { file: string; prepend: strin
   return resolved;
 }
 
+/** Thrown by spawnCli({ strict: true }) on Windows when the command can't be spawned without
+ *  a shell — strict callers must never let cmd.exe interpret their argv. */
+export class ShellFallbackRefusedError extends Error {
+  constructor(readonly command: string) {
+    super(`'${command}' cannot be spawned without cmd.exe on Windows (no .exe / .js target found)`);
+    this.name = 'ShellFallbackRefusedError';
+  }
+}
+
+export interface SpawnCliOptions {
+  /** Never fall back to shell:true; throw ShellFallbackRefusedError instead. Use this when argv
+   *  carries untrusted text (e.g. a WeChat message), where cmd.exe parsing means injection. */
+  strict?: boolean;
+  /** Test seams: override the platform check and the Windows target resolution. */
+  win?: boolean;
+  resolveTarget?: (cmd: string) => { file: string; prepend: string[] } | null;
+}
+
 /** Spawn a CLI so that every argv element reaches the child verbatim on all platforms.
  *  POSIX: plain spawn (no shell). Windows: spawn past the `.cmd` shim (node.exe + entry, or the
  *  native .exe) so cmd.exe never re-parses the argv; only if that resolution fails do we fall
- *  back to the legacy shell:true path. Use this for any adapter that puts free-form user text
- *  on argv (e.g. Kimi's `-p <prompt>`); it also protects user-controlled flag VALUES
- *  (/system, /dir, /model) that would otherwise be mangled by cmd.exe. */
-export function spawnCli(cmd: string, args: string[], opts: import('node:child_process').SpawnOptions): ChildProcess {
-  if (!WIN) {
+ *  back to the legacy shell:true path (or throw, with `strict`). Use this for any adapter that
+ *  puts free-form user text on argv (e.g. Kimi's `-p <prompt>`); it also protects user-controlled
+ *  flag VALUES (/system, /dir, /model) that would otherwise be mangled by cmd.exe. */
+export function spawnCli(
+  cmd: string, args: string[], opts: import('node:child_process').SpawnOptions, cliOpts: SpawnCliOptions = {},
+): ChildProcess {
+  if (!(cliOpts.win ?? WIN)) {
     log.debug(`[spawn] ${cmd} ${args.map((a) => JSON.stringify(a)).join(' ')}`);
     return spawn(cmd, args, opts);
   }
-  const target = resolveWinDirectTarget(cmd);
+  const target = (cliOpts.resolveTarget ?? resolveWinDirectTarget)(cmd);
   if (target) {
     const full = [...target.prepend, ...args];
     log.debug(`[spawn] ${target.file} ${full.map((a) => JSON.stringify(a)).join(' ')}`);
     return spawn(target.file, full, { ...opts, shell: false, windowsVerbatimArguments: false });
   }
+  if (cliOpts.strict) throw new ShellFallbackRefusedError(cmd);
   log.warn(`[spawn] '${cmd}' not resolved past shell; argv with & | % " ^ may be mangled on Windows`);
   return spawnProc(cmd, args, opts);
 }
@@ -294,4 +334,199 @@ export function stripAnsi(str: string): string {
 /** Returns true only when text matches known session/resume failure patterns from CLI tools. */
 export function isSessionError(text: string): boolean {
   return /session.*not.*(found|exist)|no.*(valid|previous).*session|invalid.*session|session.*(invalid|expired|not.*found)|cannot.*resume|resume.*(fail|not.*found)/i.test(text);
+}
+
+export function truncate(text: string, maxLen: number): string {
+  return text.length > maxLen ? `${text.substring(0, maxLen)}...` : text;
+}
+
+export function basenameFromPath(pathLike: string): string {
+  const parts = pathLike.split(/[\\/]/).filter(Boolean);
+  return parts.length > 0 ? parts[parts.length - 1] : pathLike;
+}
+
+export function asString(value: unknown): string {
+  if (typeof value === 'string') return value;
+  if (value === null || value === undefined) return '';
+  if (Array.isArray(value)) return value.map(asString).filter(Boolean).join(' ');
+  if (typeof value === 'object') {
+    const obj = value as Record<string, unknown>;
+    const preferred = ['text', 'output', 'result', 'content', 'message'];
+    for (const key of preferred) {
+      if (key in obj) {
+        const text = asString(obj[key]);
+        if (text) return text;
+      }
+    }
+    try {
+      return JSON.stringify(obj);
+    } catch {
+      return String(value);
+    }
+  }
+  return String(value);
+}
+
+export function pickStringField(obj: Record<string, unknown>, keys: string[]): string {
+  for (const key of keys) {
+    if (!(key in obj)) continue;
+    const value = asString(obj[key]).trim();
+    if (value) return value;
+  }
+  return '';
+}
+
+export function summarizeToolUse(toolName: string, input: unknown): string {
+  const t = toolName || 'Tool';
+  const obj = (input && typeof input === 'object') ? (input as Record<string, unknown>) : {};
+
+  if (/^bash$/i.test(t)) {
+    const cmd = pickStringField(obj, ['command', 'cmd', 'script']);
+    return cmd
+      ? `- Shell Command: \`${truncate(cmd.replace(/\s+/g, ' ').trim(), 120)}\``
+      : '- Shell Command';
+  }
+
+  if (/^read$/i.test(t)) {
+    const path = pickStringField(obj, ['file_path', 'path', 'filePath']);
+    return path
+      ? `- Read File: \`${basenameFromPath(path)}\``
+      : '- Read File';
+  }
+
+  if (/^skill$/i.test(t)) {
+    const skill = pickStringField(obj, ['skill', 'name', 'skillName']);
+    return skill
+      ? `- Skill: \`${basenameFromPath(skill)}\``
+      : '- Skill';
+  }
+
+  if (/^glob$/i.test(t)) {
+    const pattern = pickStringField(obj, ['pattern', 'glob']);
+    return pattern
+      ? `- Glob: \`${truncate(pattern, 80)}\``
+      : '- Glob';
+  }
+
+  if (/^grep$/i.test(t)) {
+    const pattern = pickStringField(obj, ['pattern', 'query', 'regex']);
+    return pattern
+      ? `- Grep: \`${truncate(pattern, 80)}\``
+      : '- Grep';
+  }
+
+  if (/^ls$/i.test(t)) {
+    const path = pickStringField(obj, ['path', 'directory']);
+    return path
+      ? `- LS: \`${truncate(path, 80)}\``
+      : '- LS';
+  }
+
+  if (/^edit$/i.test(t)) {
+    const path = pickStringField(obj, ['file_path', 'path', 'filePath']);
+    return path
+      ? `- Edit File: \`${basenameFromPath(path)}\``
+      : '- Edit File';
+  }
+
+  if (/^write$/i.test(t)) {
+    const path = pickStringField(obj, ['file_path', 'path', 'filePath']);
+    return path
+      ? `- Write File: \`${basenameFromPath(path)}\``
+      : '- Write File';
+  }
+
+  if (/^multiedit$/i.test(t)) {
+    const path = pickStringField(obj, ['file_path', 'path', 'filePath']);
+    return path
+      ? `- MultiEdit: \`${basenameFromPath(path)}\``
+      : '- MultiEdit';
+  }
+
+  if (/^notebookread$/i.test(t)) {
+    const path = pickStringField(obj, ['notebook_path', 'path', 'file_path']);
+    return path
+      ? `- NotebookRead: \`${basenameFromPath(path)}\``
+      : '- NotebookRead';
+  }
+
+  if (/^notebookedit$/i.test(t)) {
+    const path = pickStringField(obj, ['notebook_path', 'path', 'file_path']);
+    return path
+      ? `- NotebookEdit: \`${basenameFromPath(path)}\``
+      : '- NotebookEdit';
+  }
+
+  if (/^webfetch$/i.test(t)) {
+    const url = pickStringField(obj, ['url', 'uri']);
+    return url
+      ? `- WebFetch: \`${truncate(url, 120)}\``
+      : '- WebFetch';
+  }
+
+  if (/^websearch$/i.test(t)) {
+    const query = pickStringField(obj, ['query', 'q', 'searchQuery']);
+    return query
+      ? `- WebSearch: \`${truncate(query, 100)}\``
+      : '- WebSearch';
+  }
+
+  if (/^(task|agent)$/i.test(t)) {
+    const sub = pickStringField(obj, ['agent', 'agent_type', 'subagent_type', 'name']);
+    const prompt = pickStringField(obj, ['description', 'prompt', 'task', 'instruction']);
+    if (sub && prompt) return `- ${t}: \`${sub}\` — ${truncate(prompt, 80)}`;
+    if (sub) return `- ${t}: \`${sub}\``;
+    if (prompt) return `- ${t}: ${truncate(prompt, 80)}`;
+    return `- ${t}`;
+  }
+
+  if (/^todowrite$/i.test(t)) {
+    return '- TodoWrite';
+  }
+
+  return `- ${t}`;
+}
+
+export function summarizeToolResult(toolName: string | undefined, content: unknown): string {
+  const text = asString(content).replace(/\s+/g, ' ').trim();
+  if (!text) return '';
+
+  const tool = (toolName || '').toLowerCase();
+  if (tool === 'bash') {
+    const exit = text.match(/Exit code\s+(-?\d+)/i);
+    if (exit) return `  ↳ Exit: ${exit[1]}`;
+    if (/\bno output\b/i.test(text)) return '  ↳ Exit: no output';
+    return '';
+  }
+
+  if (tool === 'skill') {
+    const m = text.match(/Launching skill:\s*([^\s]+)/i);
+    if (m) return `  ↳ Launch: \`${m[1]}\``;
+    return '';
+  }
+
+  if (tool === 'webfetch') {
+    const status = text.match(/\b(?:HTTP|Status)\s*[: ]\s*(\d{3})/i);
+    if (status) return `  ↳ HTTP: ${status[1]}`;
+    return '';
+  }
+
+  if (tool === 'websearch') {
+    const n = text.match(/(\d+)\s+(?:result|results|条)/i);
+    if (n) return `  ↳ Results: ${n[1]}`;
+    return '';
+  }
+
+  if (tool === 'agent' || tool === 'task') {
+    if (/completed with no output/i.test(text)) return '  ↳ Completed';
+    if (/error/i.test(text)) return '  ↳ Error';
+    return '';
+  }
+
+  if (tool === 'read') {
+    return '';
+  }
+
+  // Default: do not dump raw result excerpts to avoid noisy/low-value spam.
+  return '';
 }

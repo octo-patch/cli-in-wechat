@@ -34,6 +34,25 @@ export interface ToolConfig {
   files?: string[];
 }
 
+/**
+ * A user-defined agent in config.json (`agents: [...]`), so any CLI can be plugged in without
+ * code. A same-named entry overrides a built-in ACP preset (fields replace, `protocol` defaults
+ * to 'acp'); `disabled: true` drops it. Invalid entries are warned about and skipped.
+ */
+export interface AgentConfig {
+  name: string;
+  displayName?: string;
+  command?: string;
+  args?: string[];
+  env?: Record<string, string>;
+  protocol?: 'acp' | 'text';
+  /** ACP only: bridge /mode → the agent's ACP session mode id. */
+  modeIds?: { auto?: string; safe?: string; plan?: string };
+  /** text only: send the prompt on stdin (default) or substitute "{prompt}" in args. */
+  promptVia?: 'stdin' | 'arg';
+  disabled?: boolean;
+}
+
 export interface BridgeConfig {
   defaultTool: string;
   maxResponseChunkSize: number;
@@ -43,14 +62,19 @@ export interface BridgeConfig {
   allowAllUsers: boolean;
   workDir: string;
   tools: Record<string, ToolConfig>;
+  agents?: AgentConfig[];
 }
 
 export const DEFAULT_MAX_RESPONSE_CHUNK_BYTES = 3_800;
 
+// 1 hour. Long agent tasks (e.g. OpenCode subagent research) routinely exceed the
+// previous 5-minute default; the OpenCode server path caps total duration at this value.
+export const DEFAULT_CLI_TIMEOUT = 3_600_000;
+
 const DEFAULT_CONFIG: BridgeConfig = {
   defaultTool: 'claude',
   maxResponseChunkSize: DEFAULT_MAX_RESPONSE_CHUNK_BYTES,
-  cliTimeout: 300_000,      // 5 minutes
+  cliTimeout: DEFAULT_CLI_TIMEOUT,
   typingInterval: 5_000,    // 5 seconds
   allowedUsers: [],
   allowAllUsers: false,

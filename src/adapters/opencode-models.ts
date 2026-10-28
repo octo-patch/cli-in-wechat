@@ -1,4 +1,5 @@
-// Only filter recognized built-in text routes; custom providers and media stay visible.
+import { execSync } from 'node:child_process';
+
 function miniMaxTextModel(model: string): string | undefined {
   const id = model.toLowerCase();
   if (/^(?:minimax|minimax-cn|opencode|openrouter\/minimax)\/minimax-text-01$/.test(id)) return 'minimax-text-01';
@@ -13,10 +14,10 @@ export function ordinaryOpenCodeModels(models: string[]): string[] {
     if (id === undefined) return 2;
     if (['minimax-m3.1-flash', 'minimax-m3.1-flash-free', 'minimax-m3.1-flash:free'].includes(id)) return 0;
     if (id === 'minimax-m3') return 1;
-    return -1;
+    return 2;
   };
-  // Do not invent routes that the installed CLI has not advertised.
-  return models.filter((model) => rank(model) >= 0).sort((a, b) => rank(a) - rank(b));
+  // Keep the installed CLI's full catalog; only move current MiniMax choices first.
+  return [...models].sort((a, b) => rank(a) - rank(b));
 }
 
 export function flashEffortVariant(model: string, effort: string, verboseCatalog: string): string | undefined {
@@ -41,4 +42,41 @@ export function flashEffortVariant(model: string, effort: string, verboseCatalog
 
 export function isMiniMaxFlash(model: string): boolean {
   return miniMaxTextModel(model)?.startsWith('minimax-m3.1-flash') ?? false;
+}
+
+export function resolveMiniMaxThinkingVariant(model: string, effort: string): string | undefined {
+  const modelId = model.trim().replace(/\/+$/, '').split('/').pop()?.toLowerCase();
+  if (modelId !== 'minimax-m3') return undefined;
+  return effort.trim().toLowerCase() === 'low' ? 'none' : 'thinking';
+}
+
+const verboseCatalogCache = new Map<string, string>();
+
+export function clearOpenCodeModelCatalogCache(): void {
+  verboseCatalogCache.clear();
+}
+
+function verboseModelCatalog(workDir?: string): string {
+  const key = workDir || '';
+  const cached = verboseCatalogCache.get(key);
+  if (cached !== undefined) return cached;
+  const catalog = execSync('opencode models --verbose', {
+    cwd: workDir,
+    encoding: 'utf8',
+    timeout: 5000,
+    maxBuffer: 16 * 1024 * 1024,
+    stdio: ['ignore', 'pipe', 'ignore'],
+  });
+  verboseCatalogCache.set(key, catalog);
+  return catalog;
+}
+
+export function resolveOpenCodeVariant(model: string, effort: string, workDir?: string): string | undefined {
+  if (!isMiniMaxFlash(model)) return resolveMiniMaxThinkingVariant(model, effort);
+  try {
+    return flashEffortVariant(model, effort, verboseModelCatalog(workDir));
+  } catch {
+    // Older CLIs may not advertise Flash effort variants. Keep their default.
+    return undefined;
+  }
 }

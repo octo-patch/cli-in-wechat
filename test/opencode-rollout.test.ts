@@ -5,7 +5,11 @@ import { syncBuiltinESMExports } from 'node:module';
 import { join } from 'node:path';
 import { OpenCodeAdapter } from '../src/adapters/opencode.js';
 import { DEFAULT_SETTINGS, type UserSettings } from '../src/adapters/base.js';
-import { ordinaryOpenCodeModels, flashEffortVariant } from '../src/adapters/opencode-models.js';
+import {
+  clearOpenCodeModelCatalogCache,
+  ordinaryOpenCodeModels,
+  flashEffortVariant,
+} from '../src/adapters/opencode-models.js';
 
 const flash = 'minimax/MiniMax-M3.1-Flash';
 const levels = ['low', 'medium', 'high', 'xhigh', 'max'];
@@ -64,7 +68,7 @@ async function execute(settings: Partial<UserSettings> = {}, media = false) {
   return boundary;
 }
 
-test('ordinary choices rank available Flash before M3 and preserve custom/media routes', () => {
+test('ordinary choices rank available Flash before M3 without hiding any reported route', () => {
   const retained = ['other/model', 'custom/MiniMax-M2.7', 'minimax/speech-02-hd', 'minimax/video-01', 'minimax/my-custom-model'];
   assert.deepEqual(ordinaryOpenCodeModels([
     ...retained, 'minimax/MiniMax-M2.7', 'opencode/minimax-m2.5-free',
@@ -74,8 +78,12 @@ test('ordinary choices rank available Flash before M3 and preserve custom/media 
   ]), [
     'openrouter/minimax/minimax-m3.1-flash:free', flash, 'opencode/minimax-m3.1-flash-free',
     'minimax-cn/MiniMax-M3', 'openrouter/minimax/minimax-m3', ...retained,
+    'minimax/MiniMax-M2.7', 'opencode/minimax-m2.5-free', 'minimax/MiniMax-Text-01',
+    'openrouter/minimax/minimax-m1-80k', 'openrouter/minimax/minimax-m2.5',
   ]);
-  assert.deepEqual(ordinaryOpenCodeModels(['minimax/MiniMax-M2.7']), []);
+  assert.deepEqual(ordinaryOpenCodeModels(['minimax/MiniMax-M4', 'minimax/MiniMax-M3.5-Flash']), [
+    'minimax/MiniMax-M4', 'minimax/MiniMax-M3.5-Flash',
+  ]);
 });
 
 test('Flash only accepts an effort advertised for the exact route', () => {
@@ -88,6 +96,7 @@ test('Flash only accepts an effort advertised for the exact route', () => {
 
 for (const route of [flash, 'minimax-cn/MiniMax-M3.1-Flash', 'opencode/minimax-m3.1-flash-free', 'openrouter/minimax/minimax-m3.1-flash:free']) {
   test(`CLI boundary uses advertised Flash effort for ${route}`, async (t) => {
+    clearOpenCodeModelCatalogCache();
     mockCatalog(t, catalog(route));
     for (const effort of levels) {
       const { argv } = await execute({ model: route, effort });
@@ -100,6 +109,7 @@ for (const route of [flash, 'minimax-cn/MiniMax-M3.1-Flash', 'opencode/minimax-m
 
 for (const output of [catalog(flash, { thinking: {}, none: {} }), new Error('CLI catalog unavailable')]) {
   test('unsupported Flash effort preserves CLI defaults and media/history', async (t) => {
+    clearOpenCodeModelCatalogCache();
     mockCatalog(t, output);
     const { argv, stdin } = await execute({ model: flash, effort: 'low' }, true);
     assert.ok(!argv.includes('--variant'));
